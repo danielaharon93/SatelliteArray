@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# IDE / tool config
+.idea/
+.vscode/
+.claude/
+
+# Re-downloaded automatically by main.py (SMART-G auxdata ~535 MB, skyfield
+# ephemeris ~16 MB, Earth texture, TLE cache)
+smartg_auxdata/
+de421.bsp
+earth_texture.jpg
+tle_cache.txt
+
+# Generated output
+smartg_images/
+smartg_images_appearance_check/
+smartg_playground_images/
+
+# Reference document for the pointing-noise model
+Target_Noise_Model_Document.pdf
