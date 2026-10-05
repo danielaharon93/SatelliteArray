@@ -36,378 +36,49 @@ rather than computed from real ephemeris, and let the domain's
 periodic/non-periodic boundary (see build_scene_3d()) be switched at
 will.
 
-Run: python smartg_playground.py
+Saving and running scenarios
+----------------------------
+"Save configuration" writes every setting - plus the moment in time and the
+TLE the satellite geometry was computed from - to a JSON file (see
+playground_core.PlaygroundConfig). run_from_config.py renders such a file
+without any GUI or display, e.g. on a remote server with a GPU. The rendering
+itself lives in playground_core.py, shared by both front ends.
+
+Run: python smartg_playground.py [config.json]
+(with a config file, opens the GUI with that scenario's settings and
+satellite geometry restored)
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
 from mayavi.core.ui.api import MayaviScene, MlabSceneModel, SceneEditor
-from pyface.api import GUI
+from pyface.api import GUI, OK, FileDialog
 from skyfield.api import load
 from traits.api import Bool, Button, Enum, HasTraits, Instance, Int, List, Range, Str, observe
 from traitsui.api import CheckListEditor, HGroup, Item, VGroup, View
 
 import main
 import pointing_noise
-
-OUTPUT_DIR = Path(__file__).with_name("smartg_playground_images")
-
-# Small/fast presets for quick iteration - this is a sandbox, not the
-# production renderer (see main.SMARTG_3D_RESOLUTION_PRESETS for that).
-RESOLUTION_PRESETS = {
-    "Tiny (16x16)": (16, 16),
-    "Small (32x32)": (32, 32),
-    "Medium (64x64)": (64, 64),
-}
-DEFAULT_RESOLUTION = "Small (32x32)"
-
-# Kept safely inside the true horizon (~66 deg for a ~594 km CLOUDCT-
-# altitude orbit, see the horizon half-angle formula in
-# viewing_direction_km()'s docstring) so the chosen direction always hits
-# Earth well short of grazing incidence.
-MAX_OFF_NADIR_DEG = 55.0
+from playground_core import (
+    CONFIG_DIR,
+    DEFAULT_NOISE_PARAMS,
+    FORMATION_MODE,
+    MAX_OFF_NADIR_DEG,
+    RESOLUTION_PRESETS,
+    SINGLE_MODE,
+    PlaygroundConfig,
+    PlaygroundSimulation,
+    parse_time_utc,
+    viewing_direction_km,
+)
 
 MARKER_SCALE_KM = main.SATELLITE_MARKER_SCALE_KM
 POINT_A_MARKER_SCALE_KM = MARKER_SCALE_KM * 0.6
 # Length of the target -> sun arrow; the sun is effectively infinitely far
 # away, so only its direction means anything, this just sets how visible it is.
 SUN_ARROW_LENGTH_KM = 1500.0
-
-DEFAULT_NOISE_PARAMS = pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
-
-
-def viewing_direction_km(
-    satellite_position_km: np.ndarray, off_nadir_deg: float, azimuth_deg: float
-) -> np.ndarray:
-    """Unit vector, from the satellite, pointing `off_nadir_deg` away from
-    straight down (nadir, i.e. toward Earth's center) at `azimuth_deg` -
-    the same convention as main.zenith_azimuth_deg() (counterclockwise
-    from local east, see main.enu_basis_km()), just built the opposite
-    way: an angle in, rather than a vector out.
-
-    0 deg off-nadir is straight down regardless of azimuth. The true
-    horizon (ray exactly tangent to Earth) is at
-    ``degrees(arccos(EARTH_RADIUS_KM / |satellite_position_km|))`` from
-    nadir; azimuth_deg is unused there but must still be given."""
-    east, north, up = main.enu_basis_km(satellite_position_km)
-    down = -up
-    theta = np.radians(off_nadir_deg)
-    phi = np.radians(azimuth_deg)
-    horizontal = east * np.cos(phi) + north * np.sin(phi)
-    direction = down * np.cos(theta) + horizontal * np.sin(theta)
-    return direction / np.linalg.norm(direction)
-
-
-def build_scene_3d(lat_deg: float, periodic: bool):
-    """Like main.build_smartg_scene_3d(), except the domain's horizontal
-    boundary condition (periodic vs. non-periodic + extended margin) is a
-    parameter instead of a fixed choice - this sandbox exists specifically
-    to compare the two (see the finding that led to main.py fixing on
-    non-periodic, in build_smartg_scene_3d()'s own docstring).
-
-    Returns (wavelength_nm, atmosphere, surface, grid_3d), same as
-    main.build_smartg_scene_3d()."""
-    from smartg.albedo import AlbedoCst
-    from smartg.atmosphere import Atm1D, Atm3D, Cloud3D, read_i3rc_cloud
-    from smartg.grid3d import Grid3D
-    from smartg.surface import LambSurface
-
-    if not main.SMARTG_3D_CLOUD_PATH.exists():
-        raise FileNotFoundError(
-            f"{main.SMARTG_3D_CLOUD_PATH} not found; download it with "
-            "main.ensure_smartg_auxdata(data_type='IPRT')."
-        )
-
-    field = read_i3rc_cloud(main.SMARTG_3D_CLOUD_PATH)
-    cloud_3d = Cloud3D(
-        main.SMARTG_CLOUD_FNAME,
-        w_ref=main.SMARTG_3D_CLOUD_W_REF_NM,
-        ds=field,
-        reff_acc=main.SMARTG_3D_CLOUD_REFF_ACC,
-        reff_min=main.SMARTG_3D_CLOUD_REFF_MIN_UM,
-    )
-    grid_kwargs = {"periodic": periodic}
-    if not periodic:
-        grid_kwargs["horiz_extend_length"] = main.SMARTG_3D_HORIZ_EXTEND_KM
-    grid_3d = Grid3D(
-        field["x_bounds"].values,
-        field["y_bounds"].values,
-        field["z_bounds"].values,
-        **grid_kwargs,
-    )
-    atm_1d = Atm1D(main.SMARTG_AFGL_PROFILE, lat=lat_deg)
-    atmosphere = Atm3D(atm_1d=atm_1d, grid_3d=grid_3d, comp_3d=[cloud_3d])
-    surface = LambSurface(alb=AlbedoCst(main.SMARTG_SURFACE_ALBEDO))
-    return np.array(main.SMARTG_WAVELENGTHS_NM), atmosphere, surface, grid_3d
-
-
-def footprint_sensors(
-    grid_3d,
-    width_px: int,
-    height_px: int,
-    pos_z: float,
-    th_deg: float,
-    ph_deg: float,
-    periodic: bool,
-    offset_east_km: float = 0.0,
-    offset_north_km: float = 0.0,
-    rotation_rad: float = 0.0,
-):
-    """The image's sensor grid: one sensor per pixel over the cloud field,
-    all sharing one viewing direction - main.render_formation_images_3d()'s
-    layout - optionally moved by a pointing error: shifted by the ground
-    offset of the actual line of sight (domain x = local east, y = local
-    north, the same frame as SMART-G's azimuths) and rotated about its
-    centre by the yaw error's component about the local vertical.
-
-    Shifted pixels wrap around on a periodic domain; on a non-periodic one
-    they may land in the horizontal extension (cloud-free) but not beyond."""
-    from smartg.grid3d import locate_voxel_index
-    from smartg.sensor import Sensor, get_sensors_grid
-
-    xgrid = np.linspace(grid_3d.xgrid[0], grid_3d.xgrid[-1], width_px + 1)
-    ygrid = np.linspace(grid_3d.ygrid[0], grid_3d.ygrid[-1], height_px + 1)
-    cell_size = xgrid[1] - xgrid[0]
-
-    if offset_east_km == 0.0 and offset_north_km == 0.0 and rotation_rad == 0.0:
-        return get_sensors_grid(
-            xgrid,
-            ygrid,
-            pos_z=pos_z,
-            th_deg=th_deg,
-            ph_deg=ph_deg,
-            loc="ATMOS",
-            cell_size=cell_size,
-            grid_3d=grid_3d,
-        )
-
-    # Same pixel order as get_sensors_grid(): row by row, x varying first.
-    xx, yy = np.meshgrid(xgrid[:-1] + cell_size / 2.0, ygrid[:-1] + np.diff(ygrid) / 2.0)
-    center_x = (xgrid[0] + xgrid[-1]) / 2.0
-    center_y = (ygrid[0] + ygrid[-1]) / 2.0
-    dx, dy = xx - center_x, yy - center_y
-    cos_r, sin_r = np.cos(rotation_rad), np.sin(rotation_rad)
-    xx = center_x + cos_r * dx - sin_r * dy + offset_east_km
-    yy = center_y + sin_r * dx + cos_r * dy + offset_north_km
-
-    if periodic:
-        x0, x1 = grid_3d.xgrid[0], grid_3d.xgrid[-1]
-        y0, y1 = grid_3d.ygrid[0], grid_3d.ygrid[-1]
-        xx = x0 + (xx - x0) % (x1 - x0)
-        yy = y0 + (yy - y0) % (y1 - y0)
-    elif (
-        xx.min() <= grid_3d.xGRID[0]
-        or xx.max() >= grid_3d.xGRID[-1]
-        or yy.min() <= grid_3d.yGRID[0]
-        or yy.max() >= grid_3d.yGRID[-1]
-    ):
-        raise ValueError(
-            f"pointing error moved the image footprint "
-            f"({offset_east_km:+.2f} km E, {offset_north_km:+.2f} km N) past the "
-            f"simulation domain's edge (+-{grid_3d.xGRID[-1]:.1f} km)"
-        )
-
-    zz = np.full(xx.size, pos_z)
-    icells = locate_voxel_index(
-        grid_3d.xGRID, grid_3d.yGRID, grid_3d.zGRID, xx.ravel(), yy.ravel(), zz
-    )
-    return [
-        Sensor(
-            pos_x=float(x),
-            pos_y=float(y),
-            pos_z=pos_z,
-            th_deg=th_deg,
-            ph_deg=ph_deg,
-            loc="ATMOS",
-            cell_size=cell_size,
-            icell=int(icell),
-        )
-        for x, y, icell in zip(xx.ravel(), yy.ravel(), icells, strict=True)
-    ]
-
-
-def pointing_offset(
-    commanded_point_km: np.ndarray, true_point_km: np.ndarray
-) -> tuple[float, float]:
-    """(east, north) km from the commanded ground point to the one the
-    camera actually looks at, in the commanded point's local frame - the
-    cloud field's own (x, y) frame."""
-    east, north, _ = main.enu_basis_km(commanded_point_km)
-    delta = true_point_km - commanded_point_km
-    return float(np.dot(delta, east)), float(np.dot(delta, north))
-
-
-def render_view(
-    satellite_position_km: np.ndarray,
-    point_a_km: np.ndarray,
-    sza_deg: float,
-    saa_deg: float,
-    periodic: bool,
-    width_px: int,
-    height_px: int,
-    n_photons: float | None = None,
-    true_point_km: np.ndarray | None = None,
-    footprint_rotation_rad: float = 0.0,
-) -> tuple[np.ndarray, float, float]:
-    """Run one SMART-G 3D radiative-transfer view of the cloud field,
-    centred on point_a_km, as seen from satellite_position_km, under a
-    directly-chosen (not ephemeris-derived) sun direction.
-
-    Same technique as main.render_formation_images_3d() for a single
-    satellite: backward mode, one Sensor grid at the field's top aimed
-    along the satellite's viewing direction, a LocalEstimate toward the
-    chosen sun direction.
-
-    Returns (reflectance array of shape (height_px, width_px,
-    n_wavelengths), vza_deg, vaa_deg) - the ground-based viewing angles
-    at point_a_km this run actually used (see main.viewing_angles_deg()),
-    which generally differ from the satellite's own off-nadir angle.
-
-    With a pointing error (see pointing_noise.py), `true_point_km` is where
-    the actual line of sight hits the ground: the cloud field stays centred
-    on the commanded point_a_km, while the image footprint moves to
-    true_point_km (and turns by `footprint_rotation_rad`), viewed along the
-    actual line of sight. The returned angles are then the actual ones."""
-    main.ensure_cuda_compatible_msvc_on_path()
-    from smartg.smartg import LocalEstimate, Smartg
-
-    if n_photons is None:
-        n_photons = main.SMARTG_3D_PHOTONS_PER_PIXEL * width_px * height_px
-    if true_point_km is None:
-        true_point_km = point_a_km
-
-    lat_deg = main.geocentric_latitude_deg(point_a_km)
-    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(lat_deg, periodic)
-    atmosphere_profile = atmosphere.calc(wavelength_nm)
-
-    pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
-
-    vza_deg, vaa_deg = main.viewing_angles_deg(satellite_position_km, true_point_km)
-    offset_east_km, offset_north_km = pointing_offset(point_a_km, true_point_km)
-    sensors = footprint_sensors(
-        grid_3d,
-        width_px,
-        height_px,
-        pos_z,
-        th_deg=180.0 - vza_deg,
-        ph_deg=(vaa_deg + 180.0) % 360.0,
-        periodic=periodic,
-        offset_east_km=offset_east_km,
-        offset_north_km=offset_north_km,
-        rotation_rad=footprint_rotation_rad,
-    )
-    le = LocalEstimate(
-        th_deg=np.array([sza_deg]),
-        phi_deg=np.array([saa_deg]),
-        count_level=np.array([0]),  # 0 = UPTOA, see smartg.sensor.Sensor
-    )
-
-    ds = Smartg(back=True, opt3d=True).run(
-        wavelength=wavelength_nm,
-        atmosphere=atmosphere_profile,
-        surface=surface,
-        sensor=sensors,
-        le=le,
-        n_photons=n_photons,
-        progress=False,
-    )
-    toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
-    reflectance = toa_reflectance.values.reshape(height_px, width_px, len(wavelength_nm))
-    return reflectance, vza_deg, vaa_deg
-
-
-def render_formation_frozen(
-    target_km: np.ndarray,
-    positions_km: np.ndarray,
-    satellite_indices: list[int],
-    sza_deg: float,
-    saa_deg: float,
-    periodic: bool,
-    width_px: int,
-    height_px: int,
-    n_photons: float | None = None,
-    pointing: dict[int, tuple[np.ndarray, float]] | None = None,
-) -> dict[int, np.ndarray]:
-    """Render the CloudCT formation's frozen-in-time geometry, exactly as
-    main.py defines it (main.formation_positions_km(): satellite index
-    main.NADIR_REFERENCE_INDEX looks at its own nadir, every other
-    satellite looks at that same shared ground target - see
-    main.render_formation_images_3d()), under a directly-chosen sun
-    direction and a togglable periodic/non-periodic domain.
-
-    Unlike main.render_formation_images_3d(), which always derives the
-    sun direction from real ephemeris and always uses a non-periodic
-    domain, both are free parameters here - the point of this sandbox.
-    Otherwise the same technique: one shared atmosphere, built and
-    `.calc()`-ed once, and one `Smartg` instance reused across a
-    sequential per-satellite `run()` loop (see that function's own
-    docstring for why - GPU memory scales with sensor count, so the
-    satellites aren't batched into a single combined run).
-
-    `positions_km` are the formation's satellite positions at the single
-    frozen moment being rendered (see main.formation_positions_km());
-    `target_km` is the shared nadir target their images are centred on
-    (see main.nadir_target_km()).
-
-    `pointing` optionally gives, per satellite index, (true ground point
-    km, footprint rotation rad) for a pointing error - same meaning as
-    render_view()'s `true_point_km`/`footprint_rotation_rad`; satellites
-    missing from it point exactly at the target.
-
-    Returns {satellite_index: (height_px, width_px, n_wavelengths)
-    reflectance array}, for each index in `satellite_indices`."""
-    main.ensure_cuda_compatible_msvc_on_path()
-    from smartg.smartg import LocalEstimate, Smartg
-
-    if n_photons is None:
-        n_photons = main.SMARTG_3D_PHOTONS_PER_PIXEL * width_px * height_px
-    pointing = pointing or {}
-
-    lat_deg = main.geocentric_latitude_deg(target_km)
-    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(lat_deg, periodic)
-    atmosphere_profile = atmosphere.calc(wavelength_nm)
-
-    pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
-
-    le = LocalEstimate(
-        th_deg=np.array([sza_deg]),
-        phi_deg=np.array([saa_deg]),
-        count_level=np.array([0]),  # 0 = UPTOA, see smartg.sensor.Sensor
-    )
-
-    sg = Smartg(back=True, opt3d=True)
-
-    images = {}
-    for index in satellite_indices:
-        true_point_km, rotation_rad = pointing.get(index, (target_km, 0.0))
-        vza_deg, vaa_deg = main.viewing_angles_deg(positions_km[index], true_point_km)
-        offset_east_km, offset_north_km = pointing_offset(target_km, true_point_km)
-        sensors = footprint_sensors(
-            grid_3d,
-            width_px,
-            height_px,
-            pos_z,
-            th_deg=180.0 - vza_deg,
-            ph_deg=(vaa_deg + 180.0) % 360.0,
-            periodic=periodic,
-            offset_east_km=offset_east_km,
-            offset_north_km=offset_north_km,
-            rotation_rad=rotation_rad,
-        )
-        ds = sg.run(
-            wavelength=wavelength_nm,
-            atmosphere=atmosphere_profile,
-            surface=surface,
-            sensor=sensors,
-            le=le,
-            n_photons=n_photons,
-            progress=False,
-        )
-        toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
-        images[index] = toa_reflectance.values.reshape(height_px, width_px, len(wavelength_nm))
-
-    return images
 
 
 class SmartgPlayground(HasTraits):
@@ -464,6 +135,11 @@ class SmartgPlayground(HasTraits):
     noise_seed = Int(0)
     new_run_button = Button("New Monte-Carlo run")
     noise_budget_text = Str()
+
+    # Saved scenarios (see playground_core.PlaygroundConfig).
+    headless_renders = Range(1, 100000, 1, mode="text")
+    save_config_button = Button("Save configuration...")
+    load_config_button = Button("Load configuration...")
 
     render_button = Button("Render")
     status_text = Str()
@@ -527,47 +203,51 @@ class SmartgPlayground(HasTraits):
                 label="Pointing error",
                 show_border=True,
             ),
+            HGroup(
+                Item("save_config_button", show_label=False),
+                Item("load_config_button", show_label=False),
+                Item(
+                    "headless_renders",
+                    label="Renders in a headless run",
+                    tooltip="Saved with the configuration; each render draws fresh pointing errors",
+                ),
+                label="Scenario file",
+                show_border=True,
+            ),
             Item("status_text", show_label=False, style="readonly"),
         ),
         resizable=True,
         title="SMART-G Playground",
     )
 
-    def __init__(self, satellite, t, **traits) -> None:
+    def __init__(
+        self,
+        simulation: PlaygroundSimulation,
+        config: PlaygroundConfig | None = None,
+        **traits,
+    ) -> None:
         super().__init__(**traits)
-        self.satellite = satellite
-        self.t = t
-        self.position_km = satellite.at(t).frame_xyz(main.itrs).km
-
-        # The formation's positions, frozen at this same single moment t -
-        # see main.formation_positions_km()/main.render_formation_images_3d().
-        self._formation_time_offsets_seconds = main.formation_time_offsets_seconds(
-            satellite, t
-        )
-        self._formation_positions_km = main.formation_positions_km(
-            satellite, t, self._formation_time_offsets_seconds
-        )
-        self._formation_target_km = main.nadir_target_km(
-            self._formation_positions_km[main.NADIR_REFERENCE_INDEX]
-        )
+        self._sim = simulation
+        self.position_km = simulation.position_km
+        # The formation's positions, frozen at the simulation's single
+        # moment - see main.formation_positions_km().
+        self._formation_positions_km = simulation.formation_positions_km
+        self._formation_target_km = simulation.formation_target_km
 
         self._satellite_marker = None
         self._direction_line = None
         self._point_a_marker = None
         self.point_a_km = None
-        self._recompute_point_a()
 
         self._formation_points = None
         self._formation_arrows = None
         self._formation_target_marker = None
         self._sun_arrow = None
 
-        # Along-track direction for each satellite's camera frame (roll
-        # axis): the orbit normal crossed with its position. Every
-        # satellite shares the orbital plane, so one normal serves all.
-        self._orbit_normal = main.orbital_normal_itrs(satellite, t)
-        self._noise = pointing_noise.PointingNoise(self.noise_seed)
         self._applying_preset = False
+        if config is not None:
+            self._apply_config(config)
+        self._recompute_point_a()
         self._update_noise_budget()
 
     @observe("scene.activated")
@@ -755,7 +435,7 @@ class SmartgPlayground(HasTraits):
         self.noise_budget_text = (
             f"APE 1-sigma per axis = {sigma_deg:.4f} deg  |  "
             f"cone CE90 = {ce90_deg:.4f} deg = ~{ce90_ground_km:.2f} km on the ground at nadir  |  "
-            f"Monte-Carlo run seed {self.noise_seed}, renders so far: {self._noise.acquisition}"
+            f"Monte-Carlo run seed {self.noise_seed}, renders so far: {self._sim.noise.acquisition}"
         )
 
     @observe(
@@ -769,14 +449,7 @@ class SmartgPlayground(HasTraits):
     )
     def _noise_sigma_changed(self, event) -> None:
         if not self._applying_preset:
-            values = {
-                name: getattr(self, name)
-                for name in pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
-            }
-            self.noise_preset = next(
-                (name for name, preset in pointing_noise.PRESETS.items() if preset == values),
-                "Custom",
-            )
+            self.noise_preset = self._matching_noise_preset()
         self._update_noise_budget()
 
     @observe(["yaw_factor", "acquisition_interval_s"])
@@ -795,176 +468,176 @@ class SmartgPlayground(HasTraits):
         self._update_noise_budget()
 
     def _noise_seed_changed(self) -> None:
-        self._noise.reset(self.noise_seed)
+        self._sim.reset_noise(self.noise_seed)
         self._update_noise_budget()
 
     def _new_run_button_fired(self) -> None:
         # A new seed = new static biases and drift states for every satellite.
         self.noise_seed += 1
 
-    def _draw_pointing(self, key, position_km: np.ndarray, commanded_point_km: np.ndarray):
-        """Draw this acquisition's pointing error for one satellite and
-        ray-trace it: returns (true ground point km, footprint rotation rad,
-        short summary text)."""
-        boresight = commanded_point_km - position_km
-        boresight /= np.linalg.norm(boresight)
-        along_track = np.cross(self._orbit_normal, position_km)
-        error_rad = self._noise.draw_error_rad(key, self._noise_params())
-        true_direction = pointing_noise.perturbed_boresight(boresight, along_track, error_rad)
-        true_point_km = main.ray_sphere_intersection_km(
-            position_km, true_direction, main.EARTH_RADIUS_KM
-        )
-        # The yaw error turns the footprint about the boresight; on the
-        # ground that's its component about the local vertical (exact at
-        # nadir, an approximation off-nadir).
-        _, _, up = main.enu_basis_km(commanded_point_km)
-        rotation_rad = float(error_rad[2] * np.dot(boresight, up))
+    def _noise_values(self) -> dict:
+        return {name: getattr(self, name) for name in DEFAULT_NOISE_PARAMS}
 
-        los_error_deg = np.degrees(
-            np.arccos(np.clip(np.dot(boresight, true_direction), -1.0, 1.0))
+    def _matching_noise_preset(self) -> str:
+        values = self._noise_values()
+        return next(
+            (name for name, preset in pointing_noise.PRESETS.items() if preset == values),
+            "Custom",
         )
-        east_km, north_km = pointing_offset(commanded_point_km, true_point_km)
-        summary = (
-            f"LOS error {los_error_deg:.4f} deg, ground offset "
-            f"{np.hypot(east_km, north_km):.2f} km (E {east_km:+.2f}, N {north_km:+.2f}), "
-            f"yaw {np.degrees(error_rad[2]):+.4f} deg"
+
+    def _current_config(self) -> PlaygroundConfig:
+        """Every setting as currently shown in the GUI, plus the geometry
+        moment/TLE this window was opened with."""
+        return PlaygroundConfig(
+            tle=self._sim.tle_text,
+            time_utc=self._sim.time_utc,
+            mode=self.mode,
+            off_nadir_deg=self.off_nadir_deg,
+            view_azimuth_deg=self.view_azimuth_deg,
+            satellites_to_render=sorted(
+                int(label.split()[1]) for label in self.satellites_to_render
+            ),
+            sza_deg=self.sza_deg,
+            saa_deg=self.saa_deg,
+            periodic=self.periodic,
+            resolution=self.resolution,
+            photons_per_pixel=self.photons_per_pixel,
+            pointing_noise_enabled=self.pointing_noise_enabled,
+            yaw_factor=self.yaw_factor,
+            acquisition_interval_s=self.acquisition_interval_s,
+            noise_seed=self.noise_seed,
+            renders=self.headless_renders,
+            **self._noise_values(),
         )
-        return true_point_km, rotation_rad, summary
 
-    def _noise_file_suffix(self) -> str:
-        if not self.pointing_noise_enabled:
-            return ""
-        return f"_noise_seed{self.noise_seed}_render{self._noise.acquisition}"
+    def _apply_config(self, config: PlaygroundConfig) -> None:
+        """Set the GUI's controls from a config (its geometry moment/TLE
+        are not applied - see PlaygroundSimulation.from_config())."""
+        self.mode = config.mode
+        self.off_nadir_deg = config.off_nadir_deg
+        self.view_azimuth_deg = config.view_azimuth_deg
+        self.satellites_to_render = [f"Sat {i}" for i in config.satellites_to_render]
+        self.sza_deg = config.sza_deg
+        self.saa_deg = config.saa_deg
+        self.periodic = config.periodic
+        self.resolution = config.resolution
+        self.photons_per_pixel = config.photons_per_pixel
+        self.pointing_noise_enabled = config.pointing_noise_enabled
+        self.yaw_factor = config.yaw_factor
+        self.acquisition_interval_s = config.acquisition_interval_s
+        self.headless_renders = config.renders
+        # Set the sigmas without the preset logic reacting to each one, then
+        # name the resulting set (a preset if it matches one, else Custom).
+        self._applying_preset = True
+        try:
+            for name in DEFAULT_NOISE_PARAMS:
+                setattr(self, name, getattr(config, name))
+        finally:
+            self._applying_preset = False
+        self.noise_preset = self._matching_noise_preset()
+        self.noise_seed = config.noise_seed
+        self._sim.reset_noise(config.noise_seed)
 
-    def _render_button_fired(self) -> None:
-        width_px, height_px = RESOLUTION_PRESETS[self.resolution]
-        if self.pointing_noise_enabled:
-            # Every Render click is a new acquisition (new target / slew).
-            self._noise.begin_acquisition()
-            self._update_noise_budget()
-        if self.mode == "Single satellite":
-            self._render_single(width_px, height_px)
-        else:
-            self._render_formation(width_px, height_px)
-
-    def _render_single(self, width_px: int, height_px: int) -> None:
-        self._recompute_point_a()
-        self.status_text = (
-            f"Rendering at {width_px}x{height_px} "
-            f"(periodic={self.periodic}, off-nadir={self.off_nadir_deg:.1f} deg, "
-            f"view az={self.view_azimuth_deg:.1f} deg)..."
-        )
+    def _show_status(self, text: str) -> None:
+        self.status_text = text
         GUI.process_events()
 
-        true_point_km, rotation_rad, pointing_summary = self.point_a_km, 0.0, ""
-        if self.pointing_noise_enabled:
-            true_point_km, rotation_rad, pointing_summary = self._draw_pointing(
-                "single", self.position_km, self.point_a_km
-            )
-            pointing_summary += "  |  "
+    def _ask_config_path(self, action: str) -> Path | None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        dialog = FileDialog(
+            action=action,
+            default_directory=str(CONFIG_DIR),
+            default_filename="scenario.json" if action == "save as" else "",
+            wildcard="JSON files (*.json)|*.json|",
+        )
+        if dialog.open() != OK:
+            return None
+        path = Path(dialog.path)
+        if action == "save as" and path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
+        return path
 
+    def _save_config_button_fired(self) -> None:
+        path = self._ask_config_path("save as")
+        if path is None:
+            return
         try:
-            reflectance, vza_deg, vaa_deg = render_view(
-                self.position_km,
-                self.point_a_km,
-                self.sza_deg,
-                self.saa_deg,
-                self.periodic,
-                width_px,
-                height_px,
-                n_photons=self.photons_per_pixel * width_px * height_px,
-                true_point_km=true_point_km,
-                footprint_rotation_rad=rotation_rad,
-            )
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            path = OUTPUT_DIR / (
-                f"single_offnadir{self.off_nadir_deg:.0f}_az{self.view_azimuth_deg:.0f}_"
-                f"sza{self.sza_deg:.0f}_saa{self.saa_deg:.0f}_"
-                f"{'periodic' if self.periodic else 'nonperiodic'}"
-                f"{self._noise_file_suffix()}.png"
-            )
-            # Periodic domains run much brighter (see
-            # build_smartg_scene_3d()'s docstring) - a rough compensation,
-            # not exact for every geometry.
-            gain = 3.0 if self.periodic else main.SMARTG_3D_DEFAULT_GAIN
-            main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
-        except Exception as exc:  # a GPU/auxdata/SMART-G failure shouldn't crash the GUI
-            self.status_text = f"Render failed: {exc}"
+            config = self._current_config()
+            config.validate()
+            config.save(path)
+        except Exception as exc:
+            self.status_text = f"Could not save configuration: {exc}"
         else:
             self.status_text = (
-                f"{pointing_summary}"
-                f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
-                f"reflectance mean={reflectance.mean():.5f} max={reflectance.max():.5f}  |  "
-                f"saved {path}"
+                f"Saved configuration to {path} (geometry at {config.time_utc}) - "
+                f"run it headlessly with: python run_from_config.py {path.name}"
             )
 
-    def _render_formation(self, width_px: int, height_px: int) -> None:
-        if not self.satellites_to_render:
+    def _load_config_button_fired(self) -> None:
+        path = self._ask_config_path("open")
+        if path is None:
+            return
+        try:
+            config = PlaygroundConfig.load(path)
+        except Exception as exc:
+            self.status_text = f"Could not load configuration: {exc}"
+            return
+        self._apply_config(config)
+        self._recompute_point_a()
+        self._update_noise_budget()
+        same_geometry = (
+            parse_time_utc(config.time_utc) == parse_time_utc(self._sim.time_utc)
+            and config.tle.strip() == self._sim.tle_text.strip()
+        )
+        self.status_text = f"Loaded settings from {path}." + (
+            ""
+            if same_geometry
+            else (
+                f" Note: its satellite geometry (time {config.time_utc}) differs from "
+                f"this window's ({self._sim.time_utc}) and was not applied - open it "
+                f"with 'python smartg_playground.py {path.name}' to restore it."
+            )
+        )
+
+    def _render_button_fired(self) -> None:
+        if self.mode == FORMATION_MODE and not self.satellites_to_render:
             self.status_text = "Select at least one satellite first."
             return
-
-        satellite_indices = sorted(
-            int(label.split()[1]) for label in self.satellites_to_render
-        )
-        self.status_text = (
-            f"Rendering {len(satellite_indices)} satellite(s) at {width_px}x{height_px} "
-            f"(periodic={self.periodic})..."
-        )
-        GUI.process_events()
-
-        pointing = {}
-        summaries = []
-        if self.pointing_noise_enabled:
-            for index in satellite_indices:
-                true_point_km, rotation_rad, summary = self._draw_pointing(
-                    index, self._formation_positions_km[index], self._formation_target_km
-                )
-                pointing[index] = (true_point_km, rotation_rad)
-                summaries.append(f"Sat {index}: {summary}")
-
         try:
-            images = render_formation_frozen(
-                self._formation_target_km,
-                self._formation_positions_km,
-                satellite_indices,
-                self.sza_deg,
-                self.saa_deg,
-                self.periodic,
-                width_px,
-                height_px,
-                n_photons=self.photons_per_pixel * width_px * height_px,
-                pointing=pointing,
+            self.status_text = self._sim.render(
+                self._current_config(), on_status=self._show_status
             )
-            subdir = OUTPUT_DIR / (
-                f"formation_sza{self.sza_deg:.0f}_saa{self.saa_deg:.0f}_"
-                f"{'periodic' if self.periodic else 'nonperiodic'}"
-                f"{self._noise_file_suffix()}"
-            )
-            subdir.mkdir(parents=True, exist_ok=True)
-            gain = 3.0 if self.periodic else main.SMARTG_3D_DEFAULT_GAIN
-            paths = []
-            for index in sorted(images):
-                path = subdir / f"satellite_{index:02d}.png"
-                main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
-                paths.append(path)
         except Exception as exc:  # a GPU/auxdata/SMART-G failure shouldn't crash the GUI
             self.status_text = f"Render failed: {exc}"
-        else:
-            self.status_text = "\n".join(
-                [f"Saved {len(paths)} image(s) to {subdir}", *summaries]
-            )
+        self._update_noise_budget()
 
 
-def run_playground() -> None:
+def run_playground(config_path: Path | None = None) -> None:
     """Entry point. Named to avoid colliding with the `main` module this
-    file imports everything from."""
-    tle_text = main.get_tle()
-    satellite = main.build_satellite(tle_text)
-    ts = load.timescale()
-    t = ts.now()
-    app = SmartgPlayground(satellite, t)
+    file imports everything from.
+
+    Without `config_path`, places the satellites at the current time from
+    a live TLE. With one, restores that saved scenario's settings *and* its
+    exact satellite geometry (time + TLE)."""
+    if config_path is None:
+        tle_text = main.get_tle()
+        simulation = PlaygroundSimulation(
+            main.build_satellite(tle_text), load.timescale().now(), tle_text
+        )
+        config = None
+    else:
+        config = PlaygroundConfig.load(config_path)
+        simulation = PlaygroundSimulation.from_config(config)
+    app = SmartgPlayground(simulation, config)
     app.configure_traits()
 
 
 if __name__ == "__main__":
-    run_playground()
+    parser = argparse.ArgumentParser(description="Interactive SMART-G playground.")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        type=Path,
+        help="optional saved scenario (.json) to open, settings and geometry included",
+    )
+    run_playground(parser.parse_args().config)
