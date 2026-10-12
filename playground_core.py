@@ -52,6 +52,7 @@ CONFIG_VERSION = 1
 # original behaviour), or a wind-roughened sea reflecting by the Cox-Munk
 # slope distribution (sun glint and Fresnel reflection, polarised) - see
 # build_surface().
+
 SURFACE_LAMBERTIAN = "lambertian"
 SURFACE_OCEAN = "ocean"
 SURFACES = (SURFACE_LAMBERTIAN, SURFACE_OCEAN)
@@ -164,34 +165,19 @@ def footprint_sensors(
 ):
     """The image's sensor grid: one sensor per pixel over the cloud field,
     all sharing one viewing direction - main.render_formation_images_3d()'s
-    layout - optionally moved by a pointing error: shifted by the ground
+    layout, but each pixel samples a point (a main.SENSOR_CELL_KM start cell
+    kept inside one voxel), not the pixel's whole area - optionally moved by a pointing error: shifted by the ground
     offset of the actual line of sight (domain x = local east, y = local
     north, the same frame as SMART-G's azimuths) and rotated about its
     centre by the yaw error's component about the local vertical.
 
     Shifted pixels wrap around on a periodic domain; on a non-periodic one
     they may land in the horizontal extension (cloud-free) but not beyond."""
-    from smartg.grid3d import locate_voxel_index
-    from smartg.sensor import Sensor, get_sensors_grid
-
     xgrid = np.linspace(grid_3d.xgrid[0], grid_3d.xgrid[-1], width_px + 1)
     ygrid = np.linspace(grid_3d.ygrid[0], grid_3d.ygrid[-1], height_px + 1)
-    cell_size = xgrid[1] - xgrid[0]
-
-    if offset_east_km == 0.0 and offset_north_km == 0.0 and rotation_rad == 0.0:
-        return get_sensors_grid(
-            xgrid,
-            ygrid,
-            pos_z=pos_z,
-            th_deg=th_deg,
-            ph_deg=ph_deg,
-            loc="ATMOS",
-            cell_size=cell_size,
-            grid_3d=grid_3d,
-        )
 
     # Same pixel order as get_sensors_grid(): row by row, x varying first.
-    xx, yy = np.meshgrid(xgrid[:-1] + cell_size / 2.0, ygrid[:-1] + np.diff(ygrid) / 2.0)
+    xx, yy = np.meshgrid(xgrid[:-1] + np.diff(xgrid) / 2.0, ygrid[:-1] + np.diff(ygrid) / 2.0)
     center_x = (xgrid[0] + xgrid[-1]) / 2.0
     center_y = (ygrid[0] + ygrid[-1]) / 2.0
     dx, dy = xx - center_x, yy - center_y
@@ -216,23 +202,7 @@ def footprint_sensors(
             f"simulation domain's edge (+-{grid_3d.xGRID[-1]:.1f} km)"
         )
 
-    zz = np.full(xx.size, pos_z)
-    icells = locate_voxel_index(
-        grid_3d.xGRID, grid_3d.yGRID, grid_3d.zGRID, xx.ravel(), yy.ravel(), zz
-    )
-    return [
-        Sensor(
-            pos_x=float(x),
-            pos_y=float(y),
-            pos_z=pos_z,
-            th_deg=th_deg,
-            ph_deg=ph_deg,
-            loc="ATMOS",
-            cell_size=cell_size,
-            icell=int(icell),
-        )
-        for x, y, icell in zip(xx.ravel(), yy.ravel(), icells, strict=True)
-    ]
+    return main.sensors_at(grid_3d, xx, yy, pos_z, th_deg, ph_deg)
 
 
 def pointing_offset(

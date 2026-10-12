@@ -170,15 +170,27 @@ SMARTG_3D_RESOLUTION_PRESETS = {
 }
 SMARTG_3D_DEFAULT_RESOLUTION = "Low (64x48)"
 
+# Start cell of a pixel's photons. SMART-G's 3D mode only counts photons that
+# start in the voxel under the sensor's centre, so a pixel-sized cell (not a
+# whole number of voxels, and not aligned to them) loses part of its photons,
+# unevenly from pixel to pixel: images come out too dark (by about the pixel's
+# area in voxels, e.g. 25x for the default 20x20 grid over the 100x100 cloud
+# field) with a grid-like pattern over the dark, flat surface. A cell of a few
+# metres, kept VOXEL_EDGE_MARGIN_KM away from every voxel edge by
+# inside_voxels(), loses none - see image_sensors().
+SENSOR_CELL_KM = 1e-3
+VOXEL_EDGE_MARGIN_KM = 2e-3
+
 # Default brightness gain for saved 3D-mode images (see
-# reflectance_to_image()), higher than the uniform layer's (3.0): now that
-# the domain is non-periodic (SMARTG_3D_HORIZ_EXTEND_KM), reflectance runs
-# noticeably dimmer, especially for oblique-viewing satellites. A single
-# fixed gain can't be exactly right for every satellite at once (nadir-ish
-# views dim far less than oblique ones), this is a reasonable middle
-# ground - override with --render-gain if a given satellite looks over-
-# or under-exposed.
-SMARTG_3D_DEFAULT_GAIN = 25.0
+# reflectance_to_image()), higher than the uniform layer's (3.0): the
+# non-periodic domain (SMARTG_3D_HORIZ_EXTEND_KM) runs noticeably dimmer,
+# especially for oblique-viewing satellites. A single fixed gain can't be
+# exactly right for every satellite at once (nadir-ish views dim far less
+# than oblique ones), this is a reasonable middle ground - override with
+# --render-gain if a given satellite looks over-or under-exposed. (Was 25
+# while the pixel-sized start cells above darkened the images; 9 keeps the
+# look of a 64x64 render from before that was fixed.)
+SMARTG_3D_DEFAULT_GAIN = 9.0
 
 # Scattering-order check (estimate_scattering_order_fractions()): a smaller,
 # faster grid than a real render, since it's a diagnostic, not an image.
@@ -886,6 +898,62 @@ def render_formation_images(
     return images
 
 
+def inside_voxels(coords: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Move each coordinate that lies within VOXEL_EDGE_MARGIN_KM of a
+    voxel edge to that distance inside the voxel it is in (a move of a few
+    metres at most), so that a sensor's whole start cell lies in a single
+    voxel - see SENSOR_CELL_KM."""
+    edges = np.asarray(edges, dtype=float)
+    upper = np.clip(np.searchsorted(edges, coords, side="right"), 1, len(edges) - 1)
+    return np.clip(
+        coords,
+        edges[upper - 1] + VOXEL_EDGE_MARGIN_KM,
+        edges[upper] - VOXEL_EDGE_MARGIN_KM,
+    )
+
+
+def sensors_at(grid_3d, xx, yy, pos_z: float, th_deg: float, ph_deg: float):
+    """One backward-mode `Sensor` per (xx, yy) point (km, same-shaped
+    arrays, row by row), all at height pos_z and aimed alike: each samples
+    a SENSOR_CELL_KM start cell kept inside the voxel under it, with its
+    `icell` set - see SENSOR_CELL_KM for why."""
+    from smartg.grid3d import locate_voxel_index
+    from smartg.sensor import Sensor
+
+    xx = inside_voxels(np.ravel(xx), grid_3d.xGRID)
+    yy = inside_voxels(np.ravel(yy), grid_3d.yGRID)
+    icells = locate_voxel_index(
+        grid_3d.xGRID, grid_3d.yGRID, grid_3d.zGRID, xx, yy, np.full(xx.size, pos_z)
+    )
+    return [
+        Sensor(
+            pos_x=float(x),
+            pos_y=float(y),
+            pos_z=pos_z,
+            th_deg=th_deg,
+            ph_deg=ph_deg,
+            loc="ATMOS",
+            cell_size=SENSOR_CELL_KM,
+            icell=int(icell),
+        )
+        for x, y, icell in zip(xx, yy, icells, strict=True)
+    ]
+
+
+def image_sensors(
+    grid_3d, width_px: int, height_px: int, pos_z: float, th_deg: float, ph_deg: float
+):
+    """The image's sensor grid: one sensor per pixel, the pixels tiling the
+    cloud field's whole horizontal domain, row by row with x varying first
+    (the order of `smartg.sensor.get_sensors_grid`)."""
+    xgrid = np.linspace(grid_3d.xgrid[0], grid_3d.xgrid[-1], width_px + 1)
+    ygrid = np.linspace(grid_3d.ygrid[0], grid_3d.ygrid[-1], height_px + 1)
+    xx, yy = np.meshgrid(
+        xgrid[:-1] + np.diff(xgrid) / 2.0, ygrid[:-1] + np.diff(ygrid) / 2.0
+    )
+    return sensors_at(grid_3d, xx, yy, pos_z, th_deg, ph_deg)
+
+
 def render_formation_images_3d(
     satellite: EarthSatellite,
     t,
@@ -962,7 +1030,6 @@ def render_formation_images_3d(
     Returns {satellite_index: (height_px, width_px, n_wavelengths)
     reflectance array}, wavelengths ordered as SMARTG_WAVELENGTHS_NM."""
     ensure_cuda_compatible_msvc_on_path()
-    from smartg.sensor import get_sensors_grid
     from smartg.smartg import LocalEstimate, Smartg
 
     if height_px is None:
@@ -989,9 +1056,6 @@ def render_formation_images_3d(
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
     pos_z = grid_3d.zGRID[-1] - SMARTG_3D_SENSOR_TOP_OFFSET_KM
-    xgrid = np.linspace(grid_3d.xgrid[0], grid_3d.xgrid[-1], width_px + 1)
-    ygrid = np.linspace(grid_3d.ygrid[0], grid_3d.ygrid[-1], height_px + 1)
-    cell_size = xgrid[1] - xgrid[0]
 
     le = LocalEstimate(
         th_deg=np.array([sza_deg]),
@@ -1004,15 +1068,13 @@ def render_formation_images_3d(
     images = {}
     for done, index in enumerate(satellite_indices, start=1):
         vza_deg, vaa_deg = viewing_angles_deg(positions[index], target)
-        sensors = get_sensors_grid(
-            xgrid,
-            ygrid,
-            pos_z=pos_z,
+        sensors = image_sensors(
+            grid_3d,
+            width_px,
+            height_px,
+            pos_z,
             th_deg=180.0 - vza_deg,
             ph_deg=(vaa_deg + 180.0) % 360.0,
-            loc="ATMOS",
-            cell_size=cell_size,
-            grid_3d=grid_3d,
         )
         ds = sg.run(
             wavelength=wavelength_nm,
@@ -1077,7 +1139,6 @@ def estimate_scattering_order_fractions(
     'multi_scatter_fraction': float}, the fractions each summing what
     share of the all-orders mean reflectance came from that regime."""
     ensure_cuda_compatible_msvc_on_path()
-    from smartg.sensor import get_sensors_grid
     from smartg.smartg import LocalEstimate, Smartg
 
     if height_px is None:
@@ -1100,20 +1161,15 @@ def estimate_scattering_order_fractions(
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
     pos_z = grid_3d.zGRID[-1] - SMARTG_3D_SENSOR_TOP_OFFSET_KM
-    xgrid = np.linspace(grid_3d.xgrid[0], grid_3d.xgrid[-1], width_px + 1)
-    ygrid = np.linspace(grid_3d.ygrid[0], grid_3d.ygrid[-1], height_px + 1)
-    cell_size = xgrid[1] - xgrid[0]
 
     vza_deg, vaa_deg = viewing_angles_deg(positions[satellite_index], target)
-    sensors = get_sensors_grid(
-        xgrid,
-        ygrid,
-        pos_z=pos_z,
+    sensors = image_sensors(
+        grid_3d,
+        width_px,
+        height_px,
+        pos_z,
         th_deg=180.0 - vza_deg,
         ph_deg=(vaa_deg + 180.0) % 360.0,
-        loc="ATMOS",
-        cell_size=cell_size,
-        grid_3d=grid_3d,
     )
     le = LocalEstimate(
         th_deg=np.array([sza_deg]),
