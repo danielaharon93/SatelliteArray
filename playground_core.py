@@ -48,6 +48,16 @@ MODES = (SINGLE_MODE, FORMATION_MODE)
 
 CONFIG_VERSION = 1
 
+# Surface under the cloud field: SMART-G's flat Lambertian ground (the
+# original behaviour), or a wind-roughened sea reflecting by the Cox-Munk
+# slope distribution (sun glint and Fresnel reflection, polarised) - see
+# build_surface().
+SURFACE_LAMBERTIAN = "lambertian"
+SURFACE_OCEAN = "ocean"
+SURFACES = (SURFACE_LAMBERTIAN, SURFACE_OCEAN)
+DEFAULT_WIND_SPEED_MS = 5.0
+MAX_WIND_SPEED_MS = 30.0
+
 DEFAULT_NOISE_PARAMS = pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
 
 
@@ -73,7 +83,33 @@ def viewing_direction_km(
     return direction / np.linalg.norm(direction)
 
 
-def build_scene_3d(lat_deg: float, periodic: bool):
+def build_surface(
+    surface: str = SURFACE_LAMBERTIAN, wind_speed_ms: float = DEFAULT_WIND_SPEED_MS
+):
+    """The surface under the cloud field.
+
+    SURFACE_LAMBERTIAN is main.py's flat dark ground (albedo
+    main.SMARTG_SURFACE_ALBEDO). SURFACE_OCEAN is a Cox-Munk rough sea at
+    `wind_speed_ms` (m/s), reflection only (sur=1, brdf=True) with wave
+    shadowing: it gives sun glint and angle-dependent Fresnel reflection,
+    but no light enters the water, so there is no water-leaving radiance
+    (no blue-green sea colour). It applies over the whole domain."""
+    from smartg.albedo import AlbedoCst
+    from smartg.surface import LambSurface, RoughSurface
+
+    if surface == SURFACE_OCEAN:
+        return RoughSurface(wind=wind_speed_ms, sur=1, brdf=True, wave_shadow=True)
+    if surface == SURFACE_LAMBERTIAN:
+        return LambSurface(alb=AlbedoCst(main.SMARTG_SURFACE_ALBEDO))
+    raise ValueError(f"surface must be one of {SURFACES}, not {surface!r}")
+
+
+def build_scene_3d(
+    lat_deg: float,
+    periodic: bool,
+    surface: str = SURFACE_LAMBERTIAN,
+    wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
+):
     """Like main.build_smartg_scene_3d(), except the domain's horizontal
     boundary condition (periodic vs. non-periodic + extended margin) is a
     parameter instead of a fixed choice - this sandbox exists specifically
@@ -82,10 +118,8 @@ def build_scene_3d(lat_deg: float, periodic: bool):
 
     Returns (wavelength_nm, atmosphere, surface, grid_3d), same as
     main.build_smartg_scene_3d()."""
-    from smartg.albedo import AlbedoCst
     from smartg.atmosphere import Atm1D, Atm3D, Cloud3D, read_i3rc_cloud
     from smartg.grid3d import Grid3D
-    from smartg.surface import LambSurface
 
     if not main.SMARTG_3D_CLOUD_PATH.exists():
         raise FileNotFoundError(
@@ -112,7 +146,7 @@ def build_scene_3d(lat_deg: float, periodic: bool):
     )
     atm_1d = Atm1D(main.SMARTG_AFGL_PROFILE, lat=lat_deg)
     atmosphere = Atm3D(atm_1d=atm_1d, grid_3d=grid_3d, comp_3d=[cloud_3d])
-    surface = LambSurface(alb=AlbedoCst(main.SMARTG_SURFACE_ALBEDO))
+    surface = build_surface(surface, wind_speed_ms)
     return np.array(main.SMARTG_WAVELENGTHS_NM), atmosphere, surface, grid_3d
 
 
@@ -223,6 +257,8 @@ def render_view(
     n_photons: float | None = None,
     true_point_km: np.ndarray | None = None,
     footprint_rotation_rad: float = 0.0,
+    surface: str = SURFACE_LAMBERTIAN,
+    wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
 ) -> tuple[np.ndarray, float, float]:
     """Run one SMART-G 3D radiative-transfer view of the cloud field,
     centred on point_a_km, as seen from satellite_position_km, under a
@@ -242,7 +278,9 @@ def render_view(
     the actual line of sight hits the ground: the cloud field stays centred
     on the commanded point_a_km, while the image footprint moves to
     true_point_km (and turns by `footprint_rotation_rad`), viewed along the
-    actual line of sight. The returned angles are then the actual ones."""
+    actual line of sight. The returned angles are then the actual ones.
+
+    `surface`/`wind_speed_ms`: see build_surface()."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -252,7 +290,9 @@ def render_view(
         true_point_km = point_a_km
 
     lat_deg = main.geocentric_latitude_deg(point_a_km)
-    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(lat_deg, periodic)
+    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
+        lat_deg, periodic, surface, wind_speed_ms
+    )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
     pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
@@ -302,6 +342,8 @@ def render_formation_frozen(
     height_px: int,
     n_photons: float | None = None,
     pointing: dict[int, tuple[np.ndarray, float]] | None = None,
+    surface: str = SURFACE_LAMBERTIAN,
+    wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
 ) -> dict[int, np.ndarray]:
     """Render the CloudCT formation's frozen-in-time geometry, exactly as
     main.py defines it (main.formation_positions_km(): satellite index
@@ -339,7 +381,9 @@ def render_formation_frozen(
     pointing = pointing or {}
 
     lat_deg = main.geocentric_latitude_deg(target_km)
-    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(lat_deg, periodic)
+    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
+        lat_deg, periodic, surface, wind_speed_ms
+    )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
     pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
@@ -404,6 +448,8 @@ class PlaygroundConfig:
     sza_deg: float = 30.0
     saa_deg: float = 90.0
     periodic: bool = False
+    surface: str = SURFACE_LAMBERTIAN
+    wind_speed_ms: float = DEFAULT_WIND_SPEED_MS  # only used by the ocean surface
     resolution: str = DEFAULT_RESOLUTION
     photons_per_pixel: float = main.SMARTG_3D_PHOTONS_PER_PIXEL
 
@@ -443,6 +489,10 @@ class PlaygroundConfig:
                 f"resolution must be one of {list(RESOLUTION_PRESETS)}, "
                 f"not {self.resolution!r}"
             )
+        if self.surface not in SURFACES:
+            raise ValueError(f"surface must be one of {SURFACES}, not {self.surface!r}")
+        if not 0.0 <= self.wind_speed_ms <= MAX_WIND_SPEED_MS:
+            raise ValueError(f"wind_speed_ms must be in [0, {MAX_WIND_SPEED_MS}]")
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
             raise ValueError(f"off_nadir_deg must be in [0, {MAX_OFF_NADIR_DEG}]")
         if not all(0 <= i < main.NUM_SATELLITES for i in self.satellites_to_render):
@@ -602,6 +652,11 @@ class PlaygroundSimulation:
         )
         return true_point_km, rotation_rad, summary
 
+    def _surface_file_suffix(self, config: PlaygroundConfig) -> str:
+        if config.surface == SURFACE_OCEAN:
+            return f"_ocean{config.wind_speed_ms:g}ms"
+        return ""
+
     def _noise_file_suffix(self, config: PlaygroundConfig) -> str:
         if not config.pointing_noise_enabled:
             return ""
@@ -636,12 +691,15 @@ class PlaygroundSimulation:
             n_photons=config.photons_per_pixel * width_px * height_px,
             true_point_km=true_point_km,
             footprint_rotation_rad=rotation_rad,
+            surface=config.surface,
+            wind_speed_ms=config.wind_speed_ms,
         )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
             f"single_offnadir{config.off_nadir_deg:.0f}_az{config.view_azimuth_deg:.0f}_"
             f"sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
             f"{'periodic' if config.periodic else 'nonperiodic'}"
+            f"{self._surface_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}.png"
         )
         # Periodic domains run much brighter (see
@@ -691,10 +749,13 @@ class PlaygroundSimulation:
             height_px,
             n_photons=config.photons_per_pixel * width_px * height_px,
             pointing=pointing,
+            surface=config.surface,
+            wind_speed_ms=config.wind_speed_ms,
         )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
             f"{'periodic' if config.periodic else 'nonperiodic'}"
+            f"{self._surface_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}"
         )
         subdir.mkdir(parents=True, exist_ok=True)

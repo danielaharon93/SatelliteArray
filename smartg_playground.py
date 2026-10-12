@@ -64,10 +64,13 @@ import pointing_noise
 from playground_core import (
     CONFIG_DIR,
     DEFAULT_NOISE_PARAMS,
+    DEFAULT_WIND_SPEED_MS,
     FORMATION_MODE,
     MAX_OFF_NADIR_DEG,
+    MAX_WIND_SPEED_MS,
     RESOLUTION_PRESETS,
     SINGLE_MODE,
+    SURFACES,
     PlaygroundConfig,
     PlaygroundSimulation,
     parse_time_utc,
@@ -106,6 +109,8 @@ class SmartgPlayground(HasTraits):
     sza_deg = Range(0.0, 100.0, 30.0)
     saa_deg = Range(0.0, 360.0, 90.0)
     periodic = Bool(False)
+    surface = Enum(list(SURFACES))
+    wind_speed_ms = Range(0.0, MAX_WIND_SPEED_MS, DEFAULT_WIND_SPEED_MS)
     resolution = Enum(list(RESOLUTION_PRESETS))
     # Default matches what render_view()/render_formation_frozen() assume
     # when n_photons isn't given; the total sent to SMART-G is this times
@@ -172,6 +177,14 @@ class SmartgPlayground(HasTraits):
             HGroup(
                 Item("sza_deg", label="Sun zenith angle (deg)"),
                 Item("saa_deg", label="Sun azimuth (deg)"),
+            ),
+            HGroup(
+                Item("surface", label="Surface"),
+                Item(
+                    "wind_speed_ms",
+                    label="Wind speed (m/s)",
+                    enabled_when="surface == 'ocean'",
+                ),
             ),
             HGroup(
                 Item("periodic", label="Periodic domain"),
@@ -500,6 +513,8 @@ class SmartgPlayground(HasTraits):
             sza_deg=self.sza_deg,
             saa_deg=self.saa_deg,
             periodic=self.periodic,
+            surface=self.surface,
+            wind_speed_ms=self.wind_speed_ms,
             resolution=self.resolution,
             photons_per_pixel=self.photons_per_pixel,
             pointing_noise_enabled=self.pointing_noise_enabled,
@@ -520,6 +535,8 @@ class SmartgPlayground(HasTraits):
         self.sza_deg = config.sza_deg
         self.saa_deg = config.saa_deg
         self.periodic = config.periodic
+        self.surface = config.surface
+        self.wind_speed_ms = config.wind_speed_ms
         self.resolution = config.resolution
         self.photons_per_pixel = config.photons_per_pixel
         self.pointing_noise_enabled = config.pointing_noise_enabled

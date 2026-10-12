@@ -97,6 +97,8 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `satellites_to_render` | Formation mode: list of satellite indices 0–9. |
 | `sza_deg`, `saa_deg` | Sun zenith / azimuth at the target (azimuth counterclockwise from local east). |
 | `periodic` | Periodic vs. non-periodic (extended) cloud-field domain. |
+| `surface` | `"lambertian"` (default: flat dark ground, albedo 0.05) or `"ocean"` (Cox-Munk wind-roughened sea: sun glint and Fresnel reflection, reflection only - no water-leaving radiance). Applies to the whole domain. |
+| `wind_speed_ms` | Wind speed in m/s (0-30, default 5) for the `"ocean"` surface; ignored for `"lambertian"`. |
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
 | `pointing_noise_enabled` | Turn the pointing-error model on. |
@@ -165,9 +167,9 @@ Editing any sigma in the GUI switches the preset to *Custom*.
 
 ### Output names
 
-Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_noise_seed<S>_render<k>].png`
+Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>].png`
 
-Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_noise_seed<S>_render<k>]/`
+Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>]/`
 containing `satellite_<NN>.png` per rendered satellite.
 
 The `_noise_seed…_render…` suffix is added when the pointing error is on, so renders of
