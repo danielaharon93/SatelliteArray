@@ -99,6 +99,7 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `periodic` | Periodic vs. non-periodic (extended) cloud-field domain. |
 | `surface` | `"lambertian"` (default: flat dark ground, albedo 0.05) or `"ocean"` (Cox-Munk wind-roughened sea: sun glint and Fresnel reflection, reflection only - no water-leaving radiance). Applies to the whole domain. |
 | `wind_speed_ms` | Wind speed in m/s (0-30, default 5) for the `"ocean"` surface; ignored for `"lambertian"`. |
+| `display_gain` | Brightness gain of the saved PNGs, `(gain × reflectance)^(1/1.8)` clipped to 1 (default 1.0: reflectance as it is, which keeps bright cloud pixels from saturating; the sea is dark). Only affects the PNG: the `.npy` next to it holds the raw reflectance. Raise it to brighten dark scenes. |
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
 | `pointing_noise_enabled` | Turn the pointing-error model on. |
@@ -167,10 +168,22 @@ Editing any sigma in the GUI switches the preset to *Custom*.
 
 ### Output names
 
-Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>].png`
+Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>].png` (+ `.npy`)
 
 Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>]/`
 containing `satellite_<NN>.png` per rendered satellite.
+
+Each PNG has a `.npy` file of the same name next to it holding the raw reflectance, before
+the display gain, gamma and clipping that turn it into the PNG (which saturates bright
+clouds). It is a float array of shape `(height, width, 3)`, rows top to bottom, with the
+last axis in the order of `main.SMARTG_WAVELENGTHS_NM` - 440, 550, 670 nm, i.e. **B, G, R**,
+not RGB. Load it with `numpy.load`; to rebuild an image with another gain:
+
+```python
+import numpy as np, main
+r = np.load("smartg_playground_images/<run>/satellite_04.npy")
+main.reflectance_to_image(r, gain=2.0, gamma=1.8).save("satellite_04_gain2.png")
+```
 
 The `_noise_seed…_render…` suffix is added when the pointing error is on, so renders of
 a run don't overwrite each other. The status text / printed log gives each satellite's

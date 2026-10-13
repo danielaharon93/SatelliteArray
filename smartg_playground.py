@@ -111,6 +111,7 @@ class SmartgPlayground(HasTraits):
     periodic = Bool(False)
     surface = Enum(list(SURFACES))
     wind_speed_ms = Range(0.0, MAX_WIND_SPEED_MS, DEFAULT_WIND_SPEED_MS)
+    display_gain = Range(0.05, 50.0, main.SMARTG_3D_DEFAULT_GAIN)
     resolution = Enum(list(RESOLUTION_PRESETS))
     # Default matches what render_view()/render_formation_frozen() assume
     # when n_photons isn't given; the total sent to SMART-G is this times
@@ -190,6 +191,7 @@ class SmartgPlayground(HasTraits):
                 Item("periodic", label="Periodic domain"),
                 Item("resolution", label="Image resolution"),
                 Item("photons_per_pixel", label="Photons per pixel"),
+                Item("display_gain", label="Display gain"),
                 Item("render_button", show_label=False),
             ),
             VGroup(
@@ -515,6 +517,7 @@ class SmartgPlayground(HasTraits):
             periodic=self.periodic,
             surface=self.surface,
             wind_speed_ms=self.wind_speed_ms,
+            display_gain=self.display_gain,
             resolution=self.resolution,
             photons_per_pixel=self.photons_per_pixel,
             pointing_noise_enabled=self.pointing_noise_enabled,
@@ -537,6 +540,7 @@ class SmartgPlayground(HasTraits):
         self.periodic = config.periodic
         self.surface = config.surface
         self.wind_speed_ms = config.wind_speed_ms
+        self.display_gain = config.display_gain
         self.resolution = config.resolution
         self.photons_per_pixel = config.photons_per_pixel
         self.pointing_noise_enabled = config.pointing_noise_enabled

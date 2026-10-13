@@ -422,6 +422,10 @@ class PlaygroundConfig:
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS  # only used by the ocean surface
     resolution: str = DEFAULT_RESOLUTION
     photons_per_pixel: float = main.SMARTG_3D_PHOTONS_PER_PIXEL
+    # Brightness gain of the saved PNGs: (gain * reflectance) ** (1/1.8),
+    # clipped to [0, 1] - see main.reflectance_to_image(). The raw reflectance
+    # is saved next to each PNG (.npy), unaffected by it.
+    display_gain: float = main.SMARTG_3D_DEFAULT_GAIN
 
     pointing_noise_enabled: bool = False
     sigma_bias_deg: float = DEFAULT_NOISE_PARAMS["sigma_bias_deg"]
@@ -471,6 +475,8 @@ class PlaygroundConfig:
             )
         if self.mode == FORMATION_MODE and not self.satellites_to_render:
             raise ValueError("satellites_to_render is empty")
+        if not self.display_gain > 0:
+            raise ValueError("display_gain must be > 0")
         if self.photons_per_pixel < 1:
             raise ValueError("photons_per_pixel must be >= 1")
         if self.renders < 1:
@@ -672,11 +678,9 @@ class PlaygroundSimulation:
             f"{self._surface_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}.png"
         )
-        # Periodic domains run much brighter (see
-        # build_smartg_scene_3d()'s docstring) - a rough compensation,
-        # not exact for every geometry.
-        gain = 3.0 if config.periodic else main.SMARTG_3D_DEFAULT_GAIN
+        gain = config.display_gain
         main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
+        np.save(path.with_suffix(".npy"), reflectance)  # raw, un-clipped
         return (
             f"{pointing_summary}"
             f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
@@ -729,10 +733,11 @@ class PlaygroundSimulation:
             f"{self._noise_file_suffix(config)}"
         )
         subdir.mkdir(parents=True, exist_ok=True)
-        gain = 3.0 if config.periodic else main.SMARTG_3D_DEFAULT_GAIN
+        gain = config.display_gain
         for index in sorted(images):
             path = subdir / f"satellite_{index:02d}.png"
             main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
+            np.save(path.with_suffix(".npy"), images[index])  # raw, un-clipped
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])
 
 

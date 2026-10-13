@@ -182,15 +182,15 @@ SENSOR_CELL_KM = 1e-3
 VOXEL_EDGE_MARGIN_KM = 2e-3
 
 # Default brightness gain for saved 3D-mode images (see
-# reflectance_to_image()), higher than the uniform layer's (3.0): the
-# non-periodic domain (SMARTG_3D_HORIZ_EXTEND_KM) runs noticeably dimmer,
-# especially for oblique-viewing satellites. A single fixed gain can't be
-# exactly right for every satellite at once (nadir-ish views dim far less
-# than oblique ones), this is a reasonable middle ground - override with
-# --render-gain if a given satellite looks over-or under-exposed. (Was 25
-# while the pixel-sized start cells above darkened the images; 9 keeps the
-# look of a 64x64 render from before that was fixed.)
-SMARTG_3D_DEFAULT_GAIN = 9.0
+# reflectance_to_image()): 1.0 shows the reflectance as it is, which keeps
+# the bright cloud pixels unsaturated (in a 64x64 nadir render over an ocean
+# surface at zenith sun the brightest reach 0.96, and reflectance_to_image()
+# clips at 1); the sea is correspondingly dark. Raise it to brighten dark
+# scenes at the cost of clipping the clouds, or lower it for brighter
+# clouds - override with --render-gain, or display_gain in a playground
+# config. (Was 25 while pixel-sized start cells darkened the images - see
+# SENSOR_CELL_KM - then 9, to keep that look.)
+SMARTG_3D_DEFAULT_GAIN = 1.0
 
 # Scattering-order check (estimate_scattering_order_fractions()): a smaller,
 # faster grid than a real render, since it's a diagnostic, not an image.
