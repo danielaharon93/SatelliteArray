@@ -171,7 +171,12 @@ Editing any sigma in the GUI switches the preset to *Custom*.
 Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>].png` (+ `.npy`)
 
 Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>]/`
-containing `satellite_<NN>.png` per rendered satellite.
+containing `satellite_<NN>.png` (+ `.npy`, `_raw.png`) per rendered satellite.
+
+Each image also gets `<name>_raw.png`: one heat map per wavelength of the raw reflectance
+on a shared 0-to-max colour scale with colour bars (no gain, gamma or clipping), and the log
+prints, per satellite and wavelength, the raw min / median / 99th percentile / max and the
+share of pixels the display gain clips.
 
 Each PNG has a `.npy` file of the same name next to it holding the raw reflectance, before
 the display gain, gamma and clipping that turn it into the PNG (which saturates bright

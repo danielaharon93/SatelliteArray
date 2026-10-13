@@ -23,6 +23,13 @@ CONFIG_PATH = "configs/scenario.json"
 # backend instead of trying to start Qt. Must be set before they're imported.
 os.environ.setdefault("ETS_TOOLKIT", "null")
 
+# smartg reads its auxiliary data location from this variable at import time
+# and raises NameError if it's unset. Default to the folder next to this file
+# (where main.ensure_smartg_auxdata() downloads it); an existing value wins.
+os.environ.setdefault(
+    "SMARTG_DIR_AUXDATA", str(Path(__file__).parent / "smartg_auxdata")
+)
+
 try:
     import playground_core
 except NotImplementedError:

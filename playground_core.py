@@ -681,11 +681,13 @@ class PlaygroundSimulation:
         gain = config.display_gain
         main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
         np.save(path.with_suffix(".npy"), reflectance)  # raw, un-clipped
+        figure_path = path.with_name(f"{path.stem}_raw.png")
+        save_reflectance_figure(reflectance, figure_path, path.stem, gain)
         return (
             f"{pointing_summary}"
             f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
-            f"reflectance mean={reflectance.mean():.5f} max={reflectance.max():.5f}  |  "
-            f"saved {path}"
+            f"saved {path} (+ .npy, {figure_path.name})\n"
+            f"Raw reflectance:\n{reflectance_stats(reflectance, gain)}"
         )
 
     def _render_formation(
@@ -738,7 +740,59 @@ class PlaygroundSimulation:
             path = subdir / f"satellite_{index:02d}.png"
             main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
             np.save(path.with_suffix(".npy"), images[index])  # raw, un-clipped
+            save_reflectance_figure(
+                images[index],
+                path.with_name(f"{path.stem}_raw.png"),
+                f"{subdir.name} / satellite {index}",
+                gain,
+            )
+            summaries.append(
+                f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain)}"
+            )
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])
+
+
+def reflectance_stats(reflectance: np.ndarray, gain: float, indent: str = "  ") -> str:
+    """One line per wavelength band describing the raw reflectance (min,
+    median, 99th percentile, max) and the share of pixels the PNG's display
+    gain clips to pure white, so saturation can be judged without the
+    image."""
+    lines = []
+    for band, wavelength_nm in enumerate(main.SMARTG_WAVELENGTHS_NM):
+        values = reflectance[..., band]
+        q50, q99 = np.percentile(values, [50, 99])
+        clipped = float(np.mean(values * gain >= 1.0))
+        lines.append(
+            f"{indent}{wavelength_nm:.0f} nm: min={values.min():.4f} median={q50:.4f} "
+            f"p99={q99:.4f} max={values.max():.4f}  |  clipped at gain {gain:g}: {clipped:.1%}"
+        )
+    return "\n".join(lines)
+
+
+def save_reflectance_figure(
+    reflectance: np.ndarray, path: Path, title: str, gain: float
+) -> None:
+    """Save the raw reflectance as one heat map per wavelength band, in
+    reflectance units on a shared 0-to-max colour scale (no display gain,
+    gamma or clipping), with a colour bar each. Uses matplotlib's Agg
+    canvas directly, so it needs no display and doesn't touch pyplot's
+    global backend."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    n_bands = reflectance.shape[-1]
+    vmax = float(reflectance.max())
+    figure = Figure(figsize=(4.4 * n_bands, 4.6), layout="constrained")
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(1, n_bands, squeeze=False)[0]
+    for band, axis in enumerate(axes):
+        image = axis.imshow(reflectance[..., band], vmin=0.0, vmax=vmax, cmap="viridis")
+        axis.set_title(f"{main.SMARTG_WAVELENGTHS_NM[band]:.0f} nm")
+        axis.set_xticks([])
+        axis.set_yticks([])
+        figure.colorbar(image, ax=axis, shrink=0.8, label="TOA reflectance")
+    figure.suptitle(f"{title}  (raw; PNG gain {gain:g} clips at {1 / gain:.3g})")
+    figure.savefig(path, dpi=110)
 
 
 def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> None:
