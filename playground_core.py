@@ -182,8 +182,11 @@ def footprint_sensors(
     center_y = (ygrid[0] + ygrid[-1]) / 2.0
     dx, dy = xx - center_x, yy - center_y
     cos_r, sin_r = np.cos(rotation_rad), np.sin(rotation_rad)
-    xx = center_x + cos_r * dx - sin_r * dy + offset_east_km
-    yy = center_y + sin_r * dx + cos_r * dy + offset_north_km
+    # Move the footprint so the line of sight passes through the field's
+    # centre at the cloud field's centre height (see main.slant_offset_km()).
+    drift_east_km, drift_north_km = main.slant_offset_km(th_deg, ph_deg, pos_z)
+    xx = center_x + cos_r * dx - sin_r * dy + offset_east_km - drift_east_km
+    yy = center_y + sin_r * dx + cos_r * dy + offset_north_km - drift_north_km
 
     if periodic:
         x0, x1 = grid_3d.xgrid[0], grid_3d.xgrid[-1]
@@ -197,9 +200,10 @@ def footprint_sensors(
         or yy.max() >= grid_3d.yGRID[-1]
     ):
         raise ValueError(
-            f"pointing error moved the image footprint "
-            f"({offset_east_km:+.2f} km E, {offset_north_km:+.2f} km N) past the "
-            f"simulation domain's edge (+-{grid_3d.xGRID[-1]:.1f} km)"
+            f"the image footprint was moved past the simulation domain's edge "
+            f"(+-{grid_3d.xGRID[-1]:.1f} km) by the pointing error "
+            f"({offset_east_km:+.2f} km E, {offset_north_km:+.2f} km N) and the "
+            f"oblique view ({-drift_east_km:+.2f} km E, {-drift_north_km:+.2f} km N)"
         )
 
     return main.sensors_at(grid_3d, xx, yy, pos_z, th_deg, ph_deg)
@@ -267,7 +271,9 @@ def render_view(
 
     pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
 
-    vza_deg, vaa_deg = main.viewing_angles_deg(satellite_position_km, true_point_km)
+    vza_deg, vaa_deg = main.viewing_angles_deg(
+        satellite_position_km, main.aim_point_km(true_point_km)
+    )
     offset_east_km, offset_north_km = pointing_offset(point_a_km, true_point_km)
     sensors = footprint_sensors(
         grid_3d,
@@ -369,7 +375,9 @@ def render_formation_frozen(
     images = {}
     for index in satellite_indices:
         true_point_km, rotation_rad = pointing.get(index, (target_km, 0.0))
-        vza_deg, vaa_deg = main.viewing_angles_deg(positions_km[index], true_point_km)
+        vza_deg, vaa_deg = main.viewing_angles_deg(
+            positions_km[index], main.aim_point_km(true_point_km)
+        )
         offset_east_km, offset_north_km = pointing_offset(target_km, true_point_km)
         sensors = footprint_sensors(
             grid_3d,

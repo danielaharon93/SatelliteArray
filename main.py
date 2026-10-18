@@ -1,4 +1,5 @@
 import argparse
+import functools
 import os
 import subprocess
 import sys
@@ -134,7 +135,15 @@ SMARTG_3D_CLOUD_REFF_ACC = 1
 # run's signal came from multiply-scattered paths long enough to wrap
 # around the domain) and removes the "grid" pattern periodic wrapping was
 # producing - see SMARTG_3D_DEFAULT_GAIN.
-SMARTG_3D_HORIZ_EXTEND_KM = 20.0
+#
+# 30 km, not less: the sensors sit at the domain's top (30 km up) and an
+# oblique view's sideways drift down to the clouds - see slant_offset_km() -
+# moves a satellite's footprint by up to 28 km * tan(VZA), 24.6 km for the
+# formation's outermost satellite (VZA 41 deg), so the margin must hold the
+# footprint (the field's half-width, 3.3 km, plus that). Going from 20 to 30
+# km changed a satellite's mean reflectance by about 1% (cloud-free pixels
+# by 4-6%: photons can wander further out and back).
+SMARTG_3D_HORIZ_EXTEND_KM = 30.0
 
 # Per-satellite image resolution, when not given explicitly: each image
 # covers the field's *entire* horizontal domain (~6.67 km), not a
@@ -898,6 +907,49 @@ def render_formation_images(
     return images
 
 
+@functools.lru_cache(maxsize=1)
+def cloud_field_center_height_km() -> float:
+    """Height (km) of the middle of the cloud field's vertical extent: halfway
+    between the base of its lowest and the top of its highest cloudy layer
+    (1.0 and 2.44 km for the cumulus field, so 1.72 km). Read once from
+    SMARTG_3D_CLOUD_PATH."""
+    from smartg.atmosphere import read_i3rc_cloud
+
+    field = read_i3rc_cloud(SMARTG_3D_CLOUD_PATH)
+    layers = np.flatnonzero((field["ext"].values > 0).any(axis=(1, 2)))
+    z_bounds = field["z_bounds"].values
+    return float((z_bounds[layers[0]] + z_bounds[layers[-1] + 1]) / 2.0)
+
+
+def aim_point_km(ground_target_km: np.ndarray, height_km: float | None = None) -> np.ndarray:
+    """The point the satellites look at: `ground_target_km` raised along its
+    local vertical to `height_km` (default: the cloud field's centre height,
+    cloud_field_center_height_km()). Aiming at the ground instead makes every
+    slanted line of sight cross the cloud layer far from the field centre -
+    see slant_offset_km()."""
+    if height_km is None:
+        height_km = cloud_field_center_height_km()
+    up = enu_basis_km(ground_target_km)[2]
+    return ground_target_km + height_km * up
+
+
+def slant_offset_km(
+    th_deg: float, ph_deg: float, pos_z: float, target_height_km: float | None = None
+) -> tuple[float, float]:
+    """(east, north) km a ray launched at height `pos_z` along the sensor
+    direction (th_deg, ph_deg) - th_deg > 90 pointing down - has drifted
+    sideways by the time it reaches `target_height_km` (default: the cloud
+    field's centre height). A sensor is placed at the point it should see
+    minus this offset, so that its line of sight passes through that point
+    at the target height: the sensors sit at the domain's top (tens of km
+    above the clouds), so without it an oblique view lands far from where the
+    sensor is."""
+    if target_height_km is None:
+        target_height_km = cloud_field_center_height_km()
+    drift = (pos_z - target_height_km) * np.tan(np.radians(180.0 - th_deg))
+    return float(drift * np.cos(np.radians(ph_deg))), float(drift * np.sin(np.radians(ph_deg)))
+
+
 def inside_voxels(coords: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """Move each coordinate that lies within VOXEL_EDGE_MARGIN_KM of a
     voxel edge to that distance inside the voxel it is in (a move of a few
@@ -945,13 +997,16 @@ def image_sensors(
 ):
     """The image's sensor grid: one sensor per pixel, the pixels tiling the
     cloud field's whole horizontal domain, row by row with x varying first
-    (the order of `smartg.sensor.get_sensors_grid`)."""
+    (the order of `smartg.sensor.get_sensors_grid`), moved so that the line of
+    sight of the central pixel passes through the field's centre at the cloud
+    field's centre height (see slant_offset_km())."""
     xgrid = np.linspace(grid_3d.xgrid[0], grid_3d.xgrid[-1], width_px + 1)
     ygrid = np.linspace(grid_3d.ygrid[0], grid_3d.ygrid[-1], height_px + 1)
     xx, yy = np.meshgrid(
         xgrid[:-1] + np.diff(xgrid) / 2.0, ygrid[:-1] + np.diff(ygrid) / 2.0
     )
-    return sensors_at(grid_3d, xx, yy, pos_z, th_deg, ph_deg)
+    drift_east, drift_north = slant_offset_km(th_deg, ph_deg, pos_z)
+    return sensors_at(grid_3d, xx - drift_east, yy - drift_north, pos_z, th_deg, ph_deg)
 
 
 def render_formation_images_3d(
@@ -1067,7 +1122,7 @@ def render_formation_images_3d(
 
     images = {}
     for done, index in enumerate(satellite_indices, start=1):
-        vza_deg, vaa_deg = viewing_angles_deg(positions[index], target)
+        vza_deg, vaa_deg = viewing_angles_deg(positions[index], aim_point_km(target))
         sensors = image_sensors(
             grid_3d,
             width_px,
@@ -1162,7 +1217,9 @@ def estimate_scattering_order_fractions(
 
     pos_z = grid_3d.zGRID[-1] - SMARTG_3D_SENSOR_TOP_OFFSET_KM
 
-    vza_deg, vaa_deg = viewing_angles_deg(positions[satellite_index], target)
+    vza_deg, vaa_deg = viewing_angles_deg(
+        positions[satellite_index], aim_point_km(target)
+    )
     sensors = image_sensors(
         grid_3d,
         width_px,

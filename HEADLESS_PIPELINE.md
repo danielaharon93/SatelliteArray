@@ -145,7 +145,7 @@ ground, the image footprint moves to where it actually lands (and turns by the y
 error), and the image is rendered along the actual line of sight. The cloud field stays
 centred on the commanded target. With a periodic domain the shifted pixels wrap around;
 with a non-periodic one they may enter the cloud-free margin, and a shift beyond the
-domain (about ±23 km) raises an error.
+domain (about ±33 km, see the oblique-views note below) raises an error.
 
 Presets (the document's illustrative starting values; engineering assumptions, not
 published figures): *6U CubeSat (C3IEL-like, ~0.1°)* and *Agile EO satellite (~0.01°)*.
@@ -165,6 +165,19 @@ Editing any sigma in the GUI switches the preset to *Custom*.
   seeded. Only the pointing errors are reproducible.
 - If the pointing error is off, `renders > 1` is ignored (one render), because repeating
   a noise-free render only rewrites the same file.
+
+### Where the satellites look (oblique views)
+
+All satellites aim at one point: the ground target raised to the **cloud field's centre
+height** (1.72 km, halfway between the lowest cloud base and the highest cloud top of the
+field), not at the ground. SMART-G's sensors sit at the top of the 3D domain (30 km), so an
+oblique line of sight drifts sideways by `(30 - 1.72) km × tan(VZA)` on its way down to the
+clouds (24.6 km at VZA 41°, the formation's outermost satellite). Each satellite's pixel
+plane is shifted back by that amount, so every satellite's central ray crosses the cloud
+field's centre at cloud height and they all see the same cloud. Aiming at the ground instead
+left most satellites of the formation looking at empty sky beside the field. The cloud-free
+margin around the field is 30 km wide (`main.SMARTG_3D_HORIZ_EXTEND_KM`) so that these
+shifted footprints fit.
 
 ### Output names
 
@@ -240,7 +253,7 @@ raises there, make it return early when `sys.platform != "win32"`.
 | `nvcc fatal: Unsupported gcc version` | Install a host compiler supported by the CUDA toolkit and point `nvcc` at it (`-ccbin`). |
 | PyCUDA can't find `cuda.h` / `libcuda` | Set `CUDA_HOME`, add `$CUDA_HOME/bin` to `PATH` and `$CUDA_HOME/lib64` to `LD_LIBRARY_PATH`. |
 | `FileNotFoundError … cumulus.dat` | Auxiliary data not downloaded; run step 5 of the server setup. |
-| `pointing error moved the image footprint … past the simulation domain's edge` | The sigmas are too large for a non-periodic domain (limit ≈ ±23 km); reduce them or use a periodic domain. |
+| `the image footprint was moved past the simulation domain's edge` | The pointing-error sigmas and/or the oblique view are too large for a non-periodic domain (limit ≈ ±33 km; the error text gives both contributions); reduce them or use a periodic domain. |
 | `NotImplementedError … doesn't implement scene_editor` | Only if the import workaround in `run_from_config.py` was removed. |
 | Loaded config's geometry "was not applied" (GUI) | Expected for the in-window **Load** button; start the GUI with the config path to restore it. |
 
