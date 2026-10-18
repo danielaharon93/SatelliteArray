@@ -33,6 +33,15 @@ RESOLUTION_PRESETS = {
     "Tiny (16x16)": (16, 16),
     "Small (32x32)": (32, 32),
     "Medium (64x64)": (64, 64),
+    # Higher-resolution options. SMART-G uses one Sensor per pixel, so run
+    # time and memory grow roughly with the pixel count - expect the larger
+    # ones to be slow.
+    "Large (128x128)": (128, 128),
+    "XL (256x256)": (256, 256),
+    "XXL (512x512)": (512, 512),
+    "Huge (1024x1024)": (1024, 1024),
+    "Low 4:3 (256x192)": (256, 192),
+    "High 4:3 (1024x768)": (1024, 768),
 }
 DEFAULT_RESOLUTION = "Small (32x32)"
 
