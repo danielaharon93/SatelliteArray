@@ -1,0 +1,18 @@
+numpy>=2.0
+requests>=2.30
+pillow>=10.0
+matplotlib>=3.8
+xarray>=2024.1
+skyfield>=1.48
+
+# 3D GUI (Mayavi / Traits stack) and a Qt backend
+mayavi>=4.8
+traits>=6.4
+traitsui>=8.0
+pyface>=8.0
+vtk>=9.3
+PyQt6>=6.6
+
+# SMART-G radiative transfer (not on PyPI; needs an NVIDIA GPU + CUDA).
+# Install separately, see https://github.com/hygeos/smartg
+# smartg
