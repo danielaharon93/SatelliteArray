@@ -102,6 +102,12 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `display_gain` | Brightness gain of the saved PNGs, `(gain × reflectance)^(1/1.8)` clipped to 1 (default 1.0: reflectance as it is, which keeps bright cloud pixels from saturating; the sea is dark). Only affects the PNG: the `.npy` next to it holds the raw reflectance. Raise it to brighten dark scenes. |
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
+| `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`) or `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)). |
+| `bomex_netcdf` | Path to the BOMEX `…com3D_int_2.nc` file (the one with the `FNCD` droplet spectrum). Required for `"bomex"`. |
+| `extinction_method` | `"q2"` (default: extinction with Q = 2, the paper's approximation) or `"mie"` (the Mie Q of each radius bin). Only used by `"bomex"`. |
+| `bomex_crop_cells` | `0` (default: the whole field) or a square of this many cells (at least 16) around the thickest column. Only used by `"bomex"`. |
+| `phase_function` | Droplet phase function, either cloud source: `"mie"` (default: the water-cloud table of SMART-G) or `"hg"` (Henyey-Greenstein). |
+| `hg_g` | Asymmetry parameter for `"hg"`, in (-1, 1) (default 0.85, typical of water clouds). |
 | `pointing_noise_enabled` | Turn the pointing-error model on. |
 | `sigma_bias_deg`, `sigma_acquisition_deg`, `sigma_drift_deg`, `drift_tau_s`, `sigma_jitter_deg`, `yaw_factor`, `acquisition_interval_s` | Pointing-error parameters (below). |
 | `noise_seed` | Random seed of the Monte-Carlo run. |
@@ -110,6 +116,33 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 The file can be edited by hand. On load it is validated: unknown keys, an unknown
 mode/resolution, out-of-range angles, bad satellite indices, `renders < 1`, a
 wrong `version` and an unparseable `time_utc` are all rejected with a message.
+
+### The BOMEX cloud
+
+With `"cloud_source": "bomex"`, the cloud is made from the droplet spectra in the netCDF
+file (`cloud_microphysics.py`): per voxel, the extinction coefficient and the effective
+radius. They are written once to a `cumulus.dat`-format file in `generated_clouds/`
+(`cumulus_file.py`, git-ignored) and reused while the dataset and the extinction method
+and crop stay the same; the first run takes about half a minute for the full 512 × 512
+field. The file name carries the dataset's name, the settings and a hash, and line 1 of
+the file records how it was made. The phase function and `g` are not in that file: they
+are applied when the scene is built.
+
+The dataset's path is stored in the config as it was typed, so on a server give a path that
+exists there. Install `netCDF4` (in `requirements.txt`) on the server too. Output images get
+a suffix naming the cloud and phase function (for example `_bomex_q2_crop200_hg0.85`); the
+original settings keep their names.
+
+#### Rendering many BOMEX files: `run_bomex_headless.py`
+
+For a server with a folder of BOMEX files, `run_bomex_headless.py` does the whole job
+with no GUI. Edit the SETTINGS block at the top (mainly `BOMEX_DIR`, the folder that
+holds the files) and run `python run_bomex_headless.py`. For each file with an `FNCD`
+spectrum it builds the cloud file and renders the scenario of `SCENARIO_CONFIG` on it,
+writing the images to `bomex_runs/<dataset name>/`. Files without `FNCD` are skipped, a
+failing file does not stop the others, and the exit code is 1 if any failed. The phase
+function is always SMART-G's Mie one. With `RENDER = False` it only builds the cloud
+files, which needs no GPU.
 
 ### Geometry is pinned
 

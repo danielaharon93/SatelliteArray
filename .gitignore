@@ -21,3 +21,8 @@ smartg_playground_images/
 
 # Reference document for the pointing-noise model
 Target_Noise_Model_Document.pdf
+
+# BOMEX cloud files generated from a netCDF dataset (see playground_core.bomex_cloud_file),
+# and the large netCDF datasets themselves
+generated_clouds/
+*.nc

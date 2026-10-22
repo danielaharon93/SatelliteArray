@@ -907,15 +907,15 @@ def render_formation_images(
     return images
 
 
-@functools.lru_cache(maxsize=1)
-def cloud_field_center_height_km() -> float:
+@functools.lru_cache(maxsize=8)
+def cloud_field_center_height_km(cloud_path: Path | None = None) -> float:
     """Height (km) of the middle of the cloud field's vertical extent: halfway
     between the base of its lowest and the top of its highest cloudy layer
-    (1.0 and 2.44 km for the cumulus field, so 1.72 km). Read once from
-    SMARTG_3D_CLOUD_PATH."""
+    (1.0 and 2.44 km for the cumulus field, so 1.72 km). Read once per file
+    from `cloud_path` (default: SMARTG_3D_CLOUD_PATH)."""
     from smartg.atmosphere import read_i3rc_cloud
 
-    field = read_i3rc_cloud(SMARTG_3D_CLOUD_PATH)
+    field = read_i3rc_cloud(cloud_path or SMARTG_3D_CLOUD_PATH)
     layers = np.flatnonzero((field["ext"].values > 0).any(axis=(1, 2)))
     z_bounds = field["z_bounds"].values
     return float((z_bounds[layers[0]] + z_bounds[layers[-1] + 1]) / 2.0)

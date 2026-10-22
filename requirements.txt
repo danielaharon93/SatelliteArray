@@ -1,8 +1,9 @@
-numpy>=2.0
+﻿numpy>=2.0
 requests>=2.30
 pillow>=10.0
 matplotlib>=3.8
 xarray>=2024.1
+netCDF4>=1.6
 skyfield>=1.48
 
 # 3D GUI (Mayavi / Traits stack) and a Qt backend

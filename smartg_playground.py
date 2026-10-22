@@ -62,12 +62,16 @@ from traitsui.api import CheckListEditor, HGroup, Item, VGroup, View
 import main
 import pointing_noise
 from playground_core import (
+    CLOUD_SOURCES,
     CONFIG_DIR,
+    DEFAULT_HG_G,
     DEFAULT_NOISE_PARAMS,
     DEFAULT_WIND_SPEED_MS,
+    EXTINCTION_METHODS,
     FORMATION_MODE,
     MAX_OFF_NADIR_DEG,
     MAX_WIND_SPEED_MS,
+    PHASE_FUNCTIONS,
     RESOLUTION_PRESETS,
     SINGLE_MODE,
     SURFACES,
@@ -119,6 +123,16 @@ class SmartgPlayground(HasTraits):
     photons_per_pixel = Range(
         1.0, 1.0e6, main.SMARTG_3D_PHOTONS_PER_PIXEL, mode="text"
     )
+
+    # The 3D cloud (see playground_core.PlaygroundConfig): SMART-G's bundled
+    # cumulus field, or one built from a BOMEX droplet-spectrum dataset.
+    cloud_source = Enum(list(CLOUD_SOURCES))
+    bomex_netcdf = Str()
+    bomex_browse_button = Button("Browse...")
+    extinction_method = Enum(list(EXTINCTION_METHODS))
+    bomex_crop_cells = Range(0, 4096, 0, mode="text")
+    phase_function = Enum(list(PHASE_FUNCTIONS))
+    hg_g = Range(-0.99, 0.99, DEFAULT_HG_G, mode="text")
 
     # Pointing error (see pointing_noise.py). Sigmas are 1 sigma per
     # cross-boresight axis; picking a preset fills them in, editing any of
@@ -193,6 +207,46 @@ class SmartgPlayground(HasTraits):
                 Item("photons_per_pixel", label="Photons per pixel"),
                 Item("display_gain", label="Display gain"),
                 Item("render_button", show_label=False),
+            ),
+            VGroup(
+                HGroup(
+                    Item(
+                        "cloud_source",
+                        label="Cloud",
+                        tooltip="bundled: SMART-G's cumulus.dat; bomex: built from a BOMEX droplet-spectrum netCDF file",
+                    ),
+                    Item(
+                        "phase_function",
+                        label="Phase function",
+                        tooltip="mie: the water-cloud table of SMART-G; hg: Henyey-Greenstein with the asymmetry parameter g",
+                    ),
+                    Item(
+                        "hg_g",
+                        label="g",
+                        tooltip="Asymmetry parameter of the Henyey-Greenstein phase function (about 0.85 for water clouds)",
+                        enabled_when="phase_function == 'hg'",
+                    ),
+                ),
+                HGroup(
+                    Item("bomex_netcdf", label="BOMEX file"),
+                    Item("bomex_browse_button", show_label=False),
+                    visible_when="cloud_source == 'bomex'",
+                ),
+                HGroup(
+                    Item(
+                        "extinction_method",
+                        label="Extinction",
+                        tooltip="q2: Q = 2 (the paper's approximation); mie: the Mie extinction efficiency of each radius bin",
+                    ),
+                    Item(
+                        "bomex_crop_cells",
+                        label="Crop (cells, 0 = whole field)",
+                        tooltip="Square of this many cells around the thickest column; 0 keeps the whole field",
+                    ),
+                    visible_when="cloud_source == 'bomex'",
+                ),
+                label="Cloud",
+                show_border=True,
             ),
             VGroup(
                 HGroup(
@@ -520,6 +574,12 @@ class SmartgPlayground(HasTraits):
             display_gain=self.display_gain,
             resolution=self.resolution,
             photons_per_pixel=self.photons_per_pixel,
+            cloud_source=self.cloud_source,
+            bomex_netcdf=self.bomex_netcdf.strip(),
+            extinction_method=self.extinction_method,
+            bomex_crop_cells=self.bomex_crop_cells,
+            phase_function=self.phase_function,
+            hg_g=self.hg_g,
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
             acquisition_interval_s=self.acquisition_interval_s,
@@ -543,6 +603,12 @@ class SmartgPlayground(HasTraits):
         self.display_gain = config.display_gain
         self.resolution = config.resolution
         self.photons_per_pixel = config.photons_per_pixel
+        self.cloud_source = config.cloud_source
+        self.bomex_netcdf = config.bomex_netcdf
+        self.extinction_method = config.extinction_method
+        self.bomex_crop_cells = config.bomex_crop_cells
+        self.phase_function = config.phase_function
+        self.hg_g = config.hg_g
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor
         self.acquisition_interval_s = config.acquisition_interval_s
@@ -577,6 +643,15 @@ class SmartgPlayground(HasTraits):
         if action == "save as" and path.suffix.lower() != ".json":
             path = path.with_suffix(".json")
         return path
+
+    def _bomex_browse_button_fired(self) -> None:
+        dialog = FileDialog(
+            action="open",
+            default_directory=str(Path(self.bomex_netcdf).parent) if self.bomex_netcdf else "",
+            wildcard="NetCDF files (*.nc)|*.nc|",
+        )
+        if dialog.open() == OK:
+            self.bomex_netcdf = dialog.path
 
     def _save_config_button_fired(self) -> None:
         path = self._ask_config_path("save as")

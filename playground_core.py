@@ -13,6 +13,7 @@ imports Mayavi/Traits - installed, but no display is needed to import them
 (see run_from_config.py).
 """
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
+import cloud_microphysics
 import main
 import pointing_noise
 
@@ -70,6 +72,24 @@ MAX_WIND_SPEED_MS = 30.0
 
 DEFAULT_NOISE_PARAMS = pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
 
+# The 3D cloud: SMART-G's bundled cumulus.dat (the original behaviour), or a
+# cloud built from a BOMEX droplet-spectrum dataset (see cloud_microphysics.py
+# and cumulus_file.py). The BOMEX cloud is written once to a cumulus.dat-format
+# file in GENERATED_CLOUD_DIR and reused while the dataset and the settings
+# that shape it (extinction method, crop) stay the same.
+CLOUD_BUNDLED = "bundled"
+CLOUD_BOMEX = "bomex"
+CLOUD_SOURCES = (CLOUD_BUNDLED, CLOUD_BOMEX)
+GENERATED_CLOUD_DIR = Path(__file__).with_name("generated_clouds")
+GENERATED_CLOUD_VERSION = 1  # bump when the generated file's content changes
+EXTINCTION_METHODS = (cloud_microphysics.EXTINCTION_Q2, cloud_microphysics.EXTINCTION_MIE)
+# Scattering phase function of the cloud droplets: the Mie phase functions of
+# SMART-G's water-cloud table (the original behaviour), or Henyey-Greenstein
+# with asymmetry parameter hg_g. Applies to either cloud source.
+PHASE_FUNCTIONS = (cloud_microphysics.PHASE_MIE, cloud_microphysics.PHASE_HG)
+DEFAULT_HG_G = 0.85
+MIN_CROP_CELLS = 16
+
 
 def viewing_direction_km(
     satellite_position_km: np.ndarray, off_nadir_deg: float, azimuth_deg: float
@@ -114,36 +134,127 @@ def build_surface(
     raise ValueError(f"surface must be one of {SURFACES}, not {surface!r}")
 
 
+@dataclass(frozen=True)
+class CloudSource:
+    """The 3D cloud a render uses: a cumulus.dat-format file, and the droplet
+    phase function ("mie": SMART-G's water-cloud table, or "hg":
+    Henyey-Greenstein with asymmetry parameter `g`)."""
+
+    dat_path: Path
+    phase_function: str = cloud_microphysics.PHASE_MIE
+    g: float = DEFAULT_HG_G
+
+    @property
+    def center_height_km(self) -> float:
+        """Height of the middle of the cloud layers, which the satellites aim at."""
+        return main.cloud_field_center_height_km(self.dat_path)
+
+
+def bundled_cloud(
+    phase_function: str = cloud_microphysics.PHASE_MIE, g: float = DEFAULT_HG_G
+) -> CloudSource:
+    """SMART-G's bundled cumulus.dat (main.SMARTG_3D_CLOUD_PATH)."""
+    return CloudSource(main.SMARTG_3D_CLOUD_PATH, phase_function, g)
+
+
+def bomex_cloud_file(
+    netcdf_path: Path | str,
+    extinction: str,
+    crop_cells: int = 0,
+    on_status: Callable[[str], None] | None = None,
+) -> Path:
+    """The cumulus.dat-format file for a BOMEX dataset, created in
+    GENERATED_CLOUD_DIR if it is not there yet (a full dataset takes about
+    half a minute) and reused after that. The file name carries a hash of the
+    dataset (path, size, modification time) and of the settings that shape the
+    cloud: the extinction method and the crop. `crop_cells` > 0 crops a square
+    of that many cells around the column with the largest optical depth, 0
+    keeps the whole field."""
+    import cumulus_file
+
+    netcdf_path = Path(netcdf_path).expanduser().resolve()
+    if not netcdf_path.is_file():
+        raise FileNotFoundError(f"BOMEX dataset not found: {netcdf_path}")
+    stat = netcdf_path.stat()
+    key = hashlib.sha1(
+        f"{netcdf_path}|{stat.st_size}|{int(stat.st_mtime)}|{extinction}|{crop_cells}|"
+        f"{GENERATED_CLOUD_VERSION}".encode()
+    ).hexdigest()[:10]
+    crop_label = f"crop{crop_cells}" if crop_cells else "full"
+    dat_path = GENERATED_CLOUD_DIR / f"{netcdf_path.stem}_{extinction}_{crop_label}_{key}.dat"
+    if dat_path.exists():
+        return dat_path
+
+    if on_status:
+        on_status(f"Building the cloud file from {netcdf_path.name} (takes a while the first time)...")
+    optics = cloud_microphysics.load_cloud_optics(netcdf_path, extinction=extinction)
+    crop = cumulus_file.crop_around_thickest_column(optics, crop_cells) if crop_cells else None
+    comment = (
+        f"{netcdf_path.name}; extinction {extinction} (Q = "
+        f"{'2' if extinction == cloud_microphysics.EXTINCTION_Q2 else 'Mie'}); "
+        f"w_ref {cloud_microphysics.SMARTG_W_REF_NM:g} nm; "
+        f"{crop_label}; made by cumulus_file.py"
+    )
+    # Write under a temporary name so that a failed run leaves no half-written
+    # file for the next one to reuse.
+    partial = dat_path.with_name(dat_path.name + ".partial")
+    cumulus_file.build_cumulus_file(optics, partial, crop, comment)
+    partial.replace(dat_path)
+    return dat_path
+
+
+def resolve_cloud(
+    config: "PlaygroundConfig", on_status: Callable[[str], None] | None = None
+) -> CloudSource:
+    """The cloud a config asks for (building the BOMEX cloud file if needed)."""
+    if config.cloud_source == CLOUD_BUNDLED:
+        return bundled_cloud(config.phase_function, config.hg_g)
+    dat_path = bomex_cloud_file(
+        config.bomex_netcdf, config.extinction_method, config.bomex_crop_cells, on_status
+    )
+    return CloudSource(dat_path, config.phase_function, config.hg_g)
+
+
 def build_scene_3d(
     lat_deg: float,
     periodic: bool,
     surface: str = SURFACE_LAMBERTIAN,
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
+    cloud: CloudSource | None = None,
 ):
     """Like main.build_smartg_scene_3d(), except the domain's horizontal
     boundary condition (periodic vs. non-periodic + extended margin) is a
     parameter instead of a fixed choice - this sandbox exists specifically
     to compare the two (see the finding that led to main.py fixing on
-    non-periodic, in build_smartg_scene_3d()'s own docstring).
+    non-periodic, in build_smartg_scene_3d()'s own docstring), and the cloud
+    (see CloudSource; default: the bundled cumulus field with its own
+    water-cloud-table phase function) is a parameter too.
 
     Returns (wavelength_nm, atmosphere, surface, grid_3d), same as
     main.build_smartg_scene_3d()."""
     from smartg.atmosphere import Atm1D, Atm3D, Cloud3D, read_i3rc_cloud
     from smartg.grid3d import Grid3D
 
-    if not main.SMARTG_3D_CLOUD_PATH.exists():
+    cloud = cloud or bundled_cloud()
+    if not cloud.dat_path.exists():
         raise FileNotFoundError(
-            f"{main.SMARTG_3D_CLOUD_PATH} not found; download it with "
+            f"{cloud.dat_path} not found; the bundled cumulus.dat is downloaded with "
             "main.ensure_smartg_auxdata(data_type='IPRT')."
         )
 
-    field = read_i3rc_cloud(main.SMARTG_3D_CLOUD_PATH)
+    field = read_i3rc_cloud(cloud.dat_path)
+    phase = (
+        cloud_microphysics.henyey_greenstein_phase(cloud.g)
+        if cloud.phase_function == cloud_microphysics.PHASE_HG
+        else None  # Cloud3D then uses the phase functions of its water-cloud table
+    )
     cloud_3d = Cloud3D(
         main.SMARTG_CLOUD_FNAME,
         w_ref=main.SMARTG_3D_CLOUD_W_REF_NM,
         ds=field,
         reff_acc=main.SMARTG_3D_CLOUD_REFF_ACC,
         reff_min=main.SMARTG_3D_CLOUD_REFF_MIN_UM,
+        phase=phase,
     )
     grid_kwargs = {"periodic": periodic}
     if not periodic:
@@ -171,6 +282,7 @@ def footprint_sensors(
     offset_east_km: float = 0.0,
     offset_north_km: float = 0.0,
     rotation_rad: float = 0.0,
+    target_height_km: float | None = None,
 ):
     """The image's sensor grid: one sensor per pixel over the cloud field,
     all sharing one viewing direction - main.render_formation_images_3d()'s
@@ -193,7 +305,7 @@ def footprint_sensors(
     cos_r, sin_r = np.cos(rotation_rad), np.sin(rotation_rad)
     # Move the footprint so the line of sight passes through the field's
     # centre at the cloud field's centre height (see main.slant_offset_km()).
-    drift_east_km, drift_north_km = main.slant_offset_km(th_deg, ph_deg, pos_z)
+    drift_east_km, drift_north_km = main.slant_offset_km(th_deg, ph_deg, pos_z, target_height_km)
     xx = center_x + cos_r * dx - sin_r * dy + offset_east_km - drift_east_km
     yy = center_y + sin_r * dx + cos_r * dy + offset_north_km - drift_north_km
 
@@ -242,6 +354,7 @@ def render_view(
     footprint_rotation_rad: float = 0.0,
     surface: str = SURFACE_LAMBERTIAN,
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
+    cloud: CloudSource | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """Run one SMART-G 3D radiative-transfer view of the cloud field,
     centred on point_a_km, as seen from satellite_position_km, under a
@@ -263,7 +376,8 @@ def render_view(
     true_point_km (and turns by `footprint_rotation_rad`), viewed along the
     actual line of sight. The returned angles are then the actual ones.
 
-    `surface`/`wind_speed_ms`: see build_surface()."""
+    `surface`/`wind_speed_ms`: see build_surface(). `cloud`: see
+    build_scene_3d() (default: the bundled cumulus field)."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -271,17 +385,18 @@ def render_view(
         n_photons = main.SMARTG_3D_PHOTONS_PER_PIXEL * width_px * height_px
     if true_point_km is None:
         true_point_km = point_a_km
+    cloud = cloud or bundled_cloud()
 
     lat_deg = main.geocentric_latitude_deg(point_a_km)
     wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
-        lat_deg, periodic, surface, wind_speed_ms
+        lat_deg, periodic, surface, wind_speed_ms, cloud
     )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
     pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
 
     vza_deg, vaa_deg = main.viewing_angles_deg(
-        satellite_position_km, main.aim_point_km(true_point_km)
+        satellite_position_km, main.aim_point_km(true_point_km, cloud.center_height_km)
     )
     offset_east_km, offset_north_km = pointing_offset(point_a_km, true_point_km)
     sensors = footprint_sensors(
@@ -295,6 +410,7 @@ def render_view(
         offset_east_km=offset_east_km,
         offset_north_km=offset_north_km,
         rotation_rad=footprint_rotation_rad,
+        target_height_km=cloud.center_height_km,
     )
     le = LocalEstimate(
         th_deg=np.array([sza_deg]),
@@ -329,6 +445,7 @@ def render_formation_frozen(
     pointing: dict[int, tuple[np.ndarray, float]] | None = None,
     surface: str = SURFACE_LAMBERTIAN,
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
+    cloud: CloudSource | None = None,
 ) -> dict[int, np.ndarray]:
     """Render the CloudCT formation's frozen-in-time geometry, exactly as
     main.py defines it (main.formation_positions_km(): satellite index
@@ -364,10 +481,11 @@ def render_formation_frozen(
     if n_photons is None:
         n_photons = main.SMARTG_3D_PHOTONS_PER_PIXEL * width_px * height_px
     pointing = pointing or {}
+    cloud = cloud or bundled_cloud()
 
     lat_deg = main.geocentric_latitude_deg(target_km)
     wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
-        lat_deg, periodic, surface, wind_speed_ms
+        lat_deg, periodic, surface, wind_speed_ms, cloud
     )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
@@ -385,7 +503,7 @@ def render_formation_frozen(
     for index in satellite_indices:
         true_point_km, rotation_rad = pointing.get(index, (target_km, 0.0))
         vza_deg, vaa_deg = main.viewing_angles_deg(
-            positions_km[index], main.aim_point_km(true_point_km)
+            positions_km[index], main.aim_point_km(true_point_km, cloud.center_height_km)
         )
         offset_east_km, offset_north_km = pointing_offset(target_km, true_point_km)
         sensors = footprint_sensors(
@@ -399,6 +517,7 @@ def render_formation_frozen(
             offset_east_km=offset_east_km,
             offset_north_km=offset_north_km,
             rotation_rad=rotation_rad,
+            target_height_km=cloud.center_height_km,
         )
         ds = sg.run(
             wavelength=wavelength_nm,
@@ -443,6 +562,20 @@ class PlaygroundConfig:
     # clipped to [0, 1] - see main.reflectance_to_image(). The raw reflectance
     # is saved next to each PNG (.npy), unaffected by it.
     display_gain: float = main.SMARTG_3D_DEFAULT_GAIN
+
+    # The 3D cloud (see CLOUD_SOURCES). With "bomex", the cloud is built from
+    # the droplet spectra of the netCDF dataset `bomex_netcdf`: beta (the
+    # extinction coefficient) from Eq. 3 with Q = 2 ("q2") or the Mie Q of each
+    # radius bin ("mie"), optionally cropped to a square of `bomex_crop_cells`
+    # cells around the thickest column (0 = the whole field).
+    cloud_source: str = CLOUD_BUNDLED
+    bomex_netcdf: str = ""
+    extinction_method: str = cloud_microphysics.EXTINCTION_Q2
+    bomex_crop_cells: int = 0
+    # Droplet phase function (either cloud source) and, for "hg", its asymmetry
+    # parameter.
+    phase_function: str = cloud_microphysics.PHASE_MIE
+    hg_g: float = DEFAULT_HG_G
 
     pointing_noise_enabled: bool = False
     sigma_bias_deg: float = DEFAULT_NOISE_PARAMS["sigma_bias_deg"]
@@ -498,6 +631,22 @@ class PlaygroundConfig:
             raise ValueError("photons_per_pixel must be >= 1")
         if self.renders < 1:
             raise ValueError("renders must be >= 1")
+        if self.cloud_source not in CLOUD_SOURCES:
+            raise ValueError(f"cloud_source must be one of {CLOUD_SOURCES}, not {self.cloud_source!r}")
+        if self.cloud_source == CLOUD_BOMEX and not self.bomex_netcdf.strip():
+            raise ValueError("bomex_netcdf (the dataset's path) is required for the bomex cloud")
+        if self.extinction_method not in EXTINCTION_METHODS:
+            raise ValueError(
+                f"extinction_method must be one of {EXTINCTION_METHODS}, not {self.extinction_method!r}"
+            )
+        if self.bomex_crop_cells != 0 and self.bomex_crop_cells < MIN_CROP_CELLS:
+            raise ValueError(f"bomex_crop_cells must be 0 (no crop) or >= {MIN_CROP_CELLS}")
+        if self.phase_function not in PHASE_FUNCTIONS:
+            raise ValueError(
+                f"phase_function must be one of {PHASE_FUNCTIONS}, not {self.phase_function!r}"
+            )
+        if not -1.0 < self.hg_g < 1.0:
+            raise ValueError("hg_g must be in (-1, 1)")
         if self.drift_tau_s <= 0:
             raise ValueError("drift_tau_s must be > 0")
         parse_time_utc(self.time_utc)  # raises ValueError if unparseable
@@ -604,11 +753,12 @@ class PlaygroundSimulation:
         message just before the (slow) SMART-G run starts."""
         config.validate()
         width_px, height_px = RESOLUTION_PRESETS[config.resolution]
+        cloud = resolve_cloud(config, on_status)  # may build the BOMEX cloud file first
         if config.pointing_noise_enabled:
             self.noise.begin_acquisition()
         if config.mode == SINGLE_MODE:
-            return self._render_single(config, width_px, height_px, on_status)
-        return self._render_formation(config, width_px, height_px, on_status)
+            return self._render_single(config, width_px, height_px, on_status, cloud)
+        return self._render_formation(config, width_px, height_px, on_status, cloud)
 
     def _draw_pointing(
         self,
@@ -650,13 +800,24 @@ class PlaygroundSimulation:
             return f"_ocean{config.wind_speed_ms:g}ms"
         return ""
 
+    def _cloud_file_suffix(self, config: PlaygroundConfig) -> str:
+        """Tells apart the images of different clouds and phase functions; empty
+        for the original settings (bundled cloud, water-cloud-table phase)."""
+        suffix = ""
+        if config.cloud_source == CLOUD_BOMEX:
+            crop = f"_crop{config.bomex_crop_cells}" if config.bomex_crop_cells else ""
+            suffix += f"_bomex_{config.extinction_method}{crop}"
+        if config.phase_function == cloud_microphysics.PHASE_HG:
+            suffix += f"_hg{config.hg_g:g}"
+        return suffix
+
     def _noise_file_suffix(self, config: PlaygroundConfig) -> str:
         if not config.pointing_noise_enabled:
             return ""
         return f"_noise_seed{config.noise_seed}_render{self.noise.acquisition}"
 
     def _render_single(
-        self, config: PlaygroundConfig, width_px: int, height_px: int, on_status
+        self, config: PlaygroundConfig, width_px: int, height_px: int, on_status, cloud: CloudSource
     ) -> str:
         point_a_km = self.point_a_km(config.off_nadir_deg, config.view_azimuth_deg)
         if on_status:
@@ -686,6 +847,7 @@ class PlaygroundSimulation:
             footprint_rotation_rad=rotation_rad,
             surface=config.surface,
             wind_speed_ms=config.wind_speed_ms,
+            cloud=cloud,
         )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
@@ -693,6 +855,7 @@ class PlaygroundSimulation:
             f"sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
             f"{'periodic' if config.periodic else 'nonperiodic'}"
             f"{self._surface_file_suffix(config)}"
+            f"{self._cloud_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}.png"
         )
         gain = config.display_gain
@@ -708,7 +871,7 @@ class PlaygroundSimulation:
         )
 
     def _render_formation(
-        self, config: PlaygroundConfig, width_px: int, height_px: int, on_status
+        self, config: PlaygroundConfig, width_px: int, height_px: int, on_status, cloud: CloudSource
     ) -> str:
         satellite_indices = sorted(config.satellites_to_render)
         if on_status:
@@ -744,11 +907,13 @@ class PlaygroundSimulation:
             pointing=pointing,
             surface=config.surface,
             wind_speed_ms=config.wind_speed_ms,
+            cloud=cloud,
         )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
             f"{'periodic' if config.periodic else 'nonperiodic'}"
             f"{self._surface_file_suffix(config)}"
+            f"{self._cloud_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}"
         )
         subdir.mkdir(parents=True, exist_ok=True)
