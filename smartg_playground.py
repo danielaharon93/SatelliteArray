@@ -36,6 +36,16 @@ rather than computed from real ephemeris, and let the domain's
 periodic/non-periodic boundary (see build_scene_3d()) be switched at
 will.
 
+Choosing the image resolution
+-----------------------------
+Every pixel is one line of sight (a sensor with no field of view), on a regular
+grid over the cloud field, so a pixel's footprint is the field's width divided by
+the pixel count. The "Voxels per pixel" button estimates, without rendering, how
+many voxels that footprint covers at the chosen resolution, and how many voxels a
+line of sight shares with its neighbours' (see
+playground_core.pixel_voxel_statistics()). When pixels are much smaller than the
+voxels, neighbours see the same voxels and a lower resolution loses nothing.
+
 Saving and running scenarios
 ----------------------------
 "Save configuration" writes every setting - plus the moment in time and the
@@ -162,6 +172,7 @@ class SmartgPlayground(HasTraits):
     load_config_button = Button("Load configuration...")
 
     render_button = Button("Render")
+    estimate_voxels_button = Button("Voxels per pixel")
     status_text = Str()
 
     view = View(
@@ -169,7 +180,7 @@ class SmartgPlayground(HasTraits):
             Item(
                 "scene",
                 editor=SceneEditor(scene_class=MayaviScene),
-                height=600,
+                height=380,  # short enough for the whole window, status line included, to fit a 1080p screen
                 width=900,
                 show_label=False,
             ),
@@ -206,6 +217,14 @@ class SmartgPlayground(HasTraits):
                 Item("resolution", label="Image resolution"),
                 Item("photons_per_pixel", label="Photons per pixel"),
                 Item("display_gain", label="Display gain"),
+                Item(
+                    "estimate_voxels_button",
+                    show_label=False,
+                    tooltip=(
+                        "Estimate how many voxels one pixel's footprint covers at the chosen "
+                        "resolution, and how many voxels neighbouring pixels share - without rendering"
+                    ),
+                ),
                 Item("render_button", show_label=False),
             ),
             VGroup(
@@ -694,6 +713,22 @@ class SmartgPlayground(HasTraits):
                 f"with 'python smartg_playground.py {path.name}' to restore it."
             )
         )
+
+    def _estimate_voxels_button_fired(self) -> None:
+        if self.mode == FORMATION_MODE and not self.satellites_to_render:
+            self.status_text = "Select at least one satellite first."
+            return
+        try:
+            summary, details = self._sim.estimate_pixel_voxels(
+                self._current_config(), on_status=self._show_status
+            )
+        except Exception as exc:  # e.g. the BOMEX file is missing
+            self.status_text = details = f"Could not estimate the voxels per pixel: {exc}"
+        else:
+            # One line per view in the window, so that several satellites fit;
+            # the full report goes to the terminal, where it is easy to read and copy.
+            self.status_text = summary + "\n(details in the terminal)"
+        print(details, flush=True)
 
     def _render_button_fired(self) -> None:
         if self.mode == FORMATION_MODE and not self.satellites_to_render:

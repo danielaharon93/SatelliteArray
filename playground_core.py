@@ -760,6 +760,87 @@ class PlaygroundSimulation:
             return self._render_single(config, width_px, height_px, on_status, cloud)
         return self._render_formation(config, width_px, height_px, on_status, cloud)
 
+    def pixel_voxel_views(
+        self,
+        config: PlaygroundConfig,
+        on_status: Callable[[str], None] | None = None,
+        resolutions: list[str] | None = None,
+    ) -> list[dict]:
+        """pixel_voxel_statistics() for each view of the configured scenario
+        (the single satellite's, or each satellite to render in formation
+        mode) at each of the named `resolutions` (default: the config's own).
+        Nothing is rendered; the pointing error is not applied. Uses the cloud
+        the config asks for (building the BOMEX cloud file first if needed),
+        read once. Returns one dict per (resolution, view): `resolution`,
+        `width_px`, `height_px`, `label`, `vza_deg` and `stats`."""
+        from smartg.atmosphere import read_i3rc_cloud
+
+        config.validate()
+        resolutions = resolutions or [config.resolution]
+        unknown = [name for name in resolutions if name not in RESOLUTION_PRESETS]
+        if unknown:
+            raise ValueError(f"unknown resolution(s) {unknown}; choose from {list(RESOLUTION_PRESETS)}")
+        cloud = resolve_cloud(config, on_status)
+        field = read_i3rc_cloud(cloud.dat_path)
+        cloudy = field["ext"].values > 0
+        height_km = cloud.center_height_km
+
+        if config.mode == SINGLE_MODE:
+            point_a_km = self.point_a_km(config.off_nadir_deg, config.view_azimuth_deg)
+            views = [("Single satellite", self.position_km, point_a_km)]
+        else:
+            views = [
+                (f"Satellite {index}", self.formation_positions_km[index], self.formation_target_km)
+                for index in sorted(config.satellites_to_render)
+            ]
+
+        results = []
+        for name in resolutions:
+            width_px, height_px = RESOLUTION_PRESETS[name]
+            for label, position_km, target_km in views:
+                vza_deg, vaa_deg = main.viewing_angles_deg(
+                    position_km, main.aim_point_km(target_km, height_km)
+                )
+                stats = pixel_voxel_statistics(
+                    field["x_bounds"].values,
+                    field["y_bounds"].values,
+                    field["z_bounds"].values,
+                    cloudy,
+                    width_px,
+                    height_px,
+                    vza_deg,
+                    vaa_deg,
+                    height_km,
+                    periodic=config.periodic,
+                )
+                results.append(
+                    dict(resolution=name, width_px=width_px, height_px=height_px,
+                         label=label, vza_deg=vza_deg, stats=stats)
+                )
+        return results
+
+    def estimate_pixel_voxels(
+        self,
+        config: PlaygroundConfig,
+        on_status: Callable[[str], None] | None = None,
+    ) -> tuple[str, str]:
+        """How many voxels a pixel of the configured scenario takes in, at the
+        config's resolution (see pixel_voxel_views()). Returns (summary,
+        details): one line per view, and the full report. Use it to pick a
+        resolution: when a pixel's footprint is much smaller than a voxel,
+        neighbouring pixels see the same voxels and a lower resolution gives
+        the same information."""
+        views = self.pixel_voxel_views(config, on_status)
+        summaries = [
+            format_pixel_voxel_summary(v["label"], v["stats"], v["vza_deg"], v["width_px"], v["height_px"])
+            for v in views
+        ]
+        reports = [
+            format_pixel_voxel_report(v["label"], v["stats"], v["vza_deg"], v["width_px"], v["height_px"])
+            for v in views
+        ]
+        return "\n".join(summaries), "\n".join(reports)
+
     def _draw_pointing(
         self,
         key,
@@ -932,6 +1013,169 @@ class PlaygroundSimulation:
                 f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain)}"
             )
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])
+
+
+def pixel_voxel_statistics(
+    x_bounds_km: np.ndarray,
+    y_bounds_km: np.ndarray,
+    z_bounds_km: np.ndarray,
+    cloudy: np.ndarray,
+    width_px: int,
+    height_px: int,
+    vza_deg: float,
+    vaa_deg: float,
+    target_height_km: float,
+    periodic: bool = False,
+    n_samples: int = 800,
+    seed: int = 0,
+) -> dict[str, float]:
+    """How many voxels one pixel of an image takes in, for the geometry of
+    footprint_sensors(): the pixels are points on a regular grid spanning the
+    cloud field (pitch = field size / pixels), all looking along the same
+    direction (view zenith `vza_deg`, view azimuth `vaa_deg`), the lines of
+    sight crossing the field's centre at `target_height_km`.
+
+    `cloudy` is the (nz, ny, nx) mask of voxels that hold cloud; the bounds are
+    those of the cloud file. Two measures, both over the cloud layers (the
+    layers from the lowest to the highest cloudy voxel):
+
+    - `voxels_per_pixel`: the pixel's footprint area divided by the area
+      a voxel casts on the plane across the line of sight (a box seen along
+      direction d casts dx*dy*|dz_d| + dy*dz*|dx_d| + dx*dz*|dy_d|). Below 1
+      the pixels are finer than the voxels, so neighbours see the same ones.
+    - the voxels that the line of sight of sampled pixels (marched through the
+      grid) crosses, and the share of them that the neighbouring pixel's line
+      of sight (right and up) crosses too.
+
+    Only the geometric line of sight is counted: photons that scatter reach
+    more voxels than the line of sight does."""
+    xb, yb, zb = (np.asarray(a, dtype=float) for a in (x_bounds_km, y_bounds_km, z_bounds_km))
+    nz, ny, nx = cloudy.shape
+    layers = np.flatnonzero(cloudy.any(axis=(1, 2)))
+    if layers.size == 0:
+        raise ValueError("the cloud has no cloudy voxel")
+    k_lo, k_hi = int(layers[0]), int(layers[-1])  # cloud layers, inclusive
+    z_lo, z_hi = float(zb[k_lo]), float(zb[k_hi + 1])
+
+    theta = np.radians(vza_deg)
+    travel_az = np.radians((vaa_deg + 180.0) % 360.0)  # direction of travel, as in the sensors
+    # Horizontal shift of the line of sight per km it descends, as in slant_offset_km().
+    shift_x, shift_y = np.tan(theta) * np.cos(travel_az), np.tan(theta) * np.sin(travel_az)
+
+    x0, x1, y0, y1 = xb[0], xb[-1], yb[0], yb[-1]
+    pitch_x, pitch_y = (x1 - x0) / width_px, (y1 - y0) / height_px
+    cell_x = np.diff(xb).mean()
+    cell_y = np.diff(yb).mean()
+    cell_z = np.diff(zb[k_lo : k_hi + 2]).mean()
+
+    direction = np.array([np.sin(theta) * np.cos(travel_az), np.sin(theta) * np.sin(travel_az), np.cos(theta)])
+    voxel_area = (
+        cell_x * cell_y * abs(direction[2])
+        + cell_y * cell_z * abs(direction[0])
+        + cell_x * cell_z * abs(direction[1])
+    )
+    pixel_area = pitch_x * pitch_y * np.cos(theta)
+    ratio = pixel_area / voxel_area
+
+    # March sample pixels' lines of sight through the cloud layers.
+    step_km = 0.25 * min(np.diff(xb).min(), np.diff(yb).min(), np.diff(zb[k_lo : k_hi + 2]).min())
+    heights = np.arange(z_hi - 1e-9, z_lo, -step_km * np.cos(theta))
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+    def voxel_ids(i: int, j: int) -> tuple[np.ndarray, np.ndarray]:
+        """(all voxels crossed, cloudy voxels crossed) by pixel column i, row j."""
+        px = x0 + (i + 0.5) * pitch_x - cx
+        py = y0 + (j + 0.5) * pitch_y - cy
+        x = cx + px + (target_height_km - heights) * shift_x
+        y = cy + py + (target_height_km - heights) * shift_y
+        if periodic:
+            x = x0 + (x - x0) % (x1 - x0)
+            y = y0 + (y - y0) % (y1 - y0)
+        ix = np.searchsorted(xb, x, side="right") - 1
+        iy = np.searchsorted(yb, y, side="right") - 1
+        iz = np.searchsorted(zb, heights, side="right") - 1
+        inside = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+        ix, iy, iz = ix[inside], iy[inside], iz[inside]
+        ids = np.unique((iz * ny + iy) * nx + ix)
+        cloudy_flat = cloudy.reshape(-1)
+        return ids, ids[cloudy_flat[ids]]
+
+    rng = np.random.default_rng(seed)
+    columns = rng.integers(0, max(width_px - 1, 1), n_samples)
+    rows = rng.integers(0, max(height_px - 1, 1), n_samples)
+    crossed, crossed_cloudy, shared, shared_cloudy = [], [], [], []
+    for i, j in zip(columns, rows):
+        own_all, own_cloudy = voxel_ids(int(i), int(j))
+        if own_cloudy.size == 0:
+            continue  # a line of sight that misses the cloud entirely
+        crossed.append(own_all.size)
+        crossed_cloudy.append(own_cloudy.size)
+        for di, dj in ((1, 0), (0, 1)):
+            if i + di >= width_px or j + dj >= height_px:
+                continue
+            other_all, other_cloudy = voxel_ids(int(i) + di, int(j) + dj)
+            shared.append(np.intersect1d(own_all, other_all).size / own_all.size)
+            shared_cloudy.append(np.intersect1d(own_cloudy, other_cloudy).size / own_cloudy.size)
+
+    return {
+        "pitch_x_km": pitch_x,
+        "pitch_y_km": pitch_y,
+        "voxel_km": (cell_x, cell_y, cell_z),
+        "voxels_per_pixel": ratio,
+        "crossed_voxels": float(np.mean(crossed)) if crossed else 0.0,
+        "crossed_cloudy_voxels": float(np.mean(crossed_cloudy)) if crossed_cloudy else 0.0,
+        "shared_fraction": float(np.mean(shared)) if shared else 0.0,
+        "shared_cloudy_fraction": float(np.mean(shared_cloudy)) if shared_cloudy else 0.0,
+        "samples": len(crossed),
+        "layers_km": (z_lo, z_hi),
+        "matched_width_px": width_px * float(np.sqrt(ratio)),
+        "matched_height_px": height_px * float(np.sqrt(ratio)),
+    }
+
+
+def format_pixel_voxel_report(
+    label: str, stats: dict[str, float], vza_deg: float, width_px: int, height_px: int
+) -> str:
+    cx, cy, cz = stats["voxel_km"]
+    ratio = stats["voxels_per_pixel"]
+    if ratio < 0.9:
+        verdict = (
+            f"finer than the voxels: neighbouring pixels see the same ones. About "
+            f"{stats['matched_width_px']:.0f} x {stats['matched_height_px']:.0f} pixels "
+            f"would match the voxel size."
+        )
+    elif ratio > 1.1:
+        verdict = (
+            f"coarser than the voxels: each pixel covers several voxels but samples one line of "
+            f"sight. About {stats['matched_width_px']:.0f} x {stats['matched_height_px']:.0f} pixels "
+            f"would match the voxel size."
+        )
+    else:
+        verdict = "about the size of a voxel's projection."
+    return (
+        f"{label} (view zenith {vza_deg:.1f} deg, {width_px}x{height_px} pixels):\n"
+        f"  pixel pitch {stats['pitch_x_km'] * 1000:.0f} x {stats['pitch_y_km'] * 1000:.0f} m; "
+        f"voxel {cx * 1000:.0f} x {cy * 1000:.0f} x {cz * 1000:.0f} m in the cloud layers "
+        f"({stats['layers_km'][0]:.2f}-{stats['layers_km'][1]:.2f} km)\n"
+        f"  voxels in a pixel's footprint: {ratio:.2f} (pixel footprint / voxel projection) - {verdict}\n"
+        f"  a line of sight crosses {stats['crossed_voxels']:.0f} voxels in the cloud layers, "
+        f"{stats['crossed_cloudy_voxels']:.0f} of them cloudy; its right/upper neighbour crosses "
+        f"{stats['shared_fraction']:.0%} of the same voxels ({stats['shared_cloudy_fraction']:.0%} of the "
+        f"cloudy ones), {stats['samples']} lines of sight sampled"
+    )
+
+
+def format_pixel_voxel_summary(
+    label: str, stats: dict[str, float], vza_deg: float, width_px: int, height_px: int
+) -> str:
+    """One line per view: format_pixel_voxel_report() without the details,
+    short enough for several satellites to fit in the GUI's status line."""
+    return (
+        f"{label} (zenith {vza_deg:.0f} deg): pixel {stats['pitch_x_km'] * 1000:.0f} m, "
+        f"voxel {stats['voxel_km'][0] * 1000:.0f} m -> {stats['voxels_per_pixel']:.2f} voxels per pixel "
+        f"(about {stats['matched_width_px']:.0f}x{stats['matched_height_px']:.0f} px match the voxels); "
+        f"neighbours share {stats['shared_fraction']:.0%} of the voxels along the line of sight"
+    )
 
 
 def reflectance_stats(reflectance: np.ndarray, gain: float, indent: str = "  ") -> str:
