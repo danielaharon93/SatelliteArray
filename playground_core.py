@@ -90,6 +90,22 @@ PHASE_FUNCTIONS = (cloud_microphysics.PHASE_MIE, cloud_microphysics.PHASE_HG)
 DEFAULT_HG_G = 0.85
 MIN_CROP_CELLS = 16
 
+# Which wavelengths SMART-G simulates: all three bands of
+# main.SMARTG_WAVELENGTHS_NM (blue, green, red - the original behaviour), or
+# just one of them, which is faster and gives a grayscale image.
+CHANNEL_ALL = "all"
+CHANNEL_BAND = {"blue": 0, "green": 1, "red": 2}  # index into main.SMARTG_WAVELENGTHS_NM
+CHANNELS = (CHANNEL_ALL, *CHANNEL_BAND)
+
+
+def channel_wavelengths_nm(channel: str) -> np.ndarray:
+    """The wavelengths (nm) a `channel` setting simulates."""
+    if channel == CHANNEL_ALL:
+        return np.array(main.SMARTG_WAVELENGTHS_NM)
+    if channel not in CHANNEL_BAND:
+        raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
+    return np.array([main.SMARTG_WAVELENGTHS_NM[CHANNEL_BAND[channel]]])
+
 
 def viewing_direction_km(
     satellite_position_km: np.ndarray, off_nadir_deg: float, azimuth_deg: float
@@ -221,6 +237,7 @@ def build_scene_3d(
     surface: str = SURFACE_LAMBERTIAN,
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
     cloud: CloudSource | None = None,
+    channel: str = CHANNEL_ALL,
 ):
     """Like main.build_smartg_scene_3d(), except the domain's horizontal
     boundary condition (periodic vs. non-periodic + extended margin) is a
@@ -228,7 +245,8 @@ def build_scene_3d(
     to compare the two (see the finding that led to main.py fixing on
     non-periodic, in build_smartg_scene_3d()'s own docstring), and the cloud
     (see CloudSource; default: the bundled cumulus field with its own
-    water-cloud-table phase function) is a parameter too.
+    water-cloud-table phase function) is a parameter too, and so is the
+    `channel` that picks the wavelengths to simulate (see channel_wavelengths_nm()).
 
     Returns (wavelength_nm, atmosphere, surface, grid_3d), same as
     main.build_smartg_scene_3d()."""
@@ -268,7 +286,7 @@ def build_scene_3d(
     atm_1d = Atm1D(main.SMARTG_AFGL_PROFILE, lat=lat_deg)
     atmosphere = Atm3D(atm_1d=atm_1d, grid_3d=grid_3d, comp_3d=[cloud_3d])
     surface = build_surface(surface, wind_speed_ms)
-    return np.array(main.SMARTG_WAVELENGTHS_NM), atmosphere, surface, grid_3d
+    return channel_wavelengths_nm(channel), atmosphere, surface, grid_3d
 
 
 def footprint_sensors(
@@ -355,6 +373,7 @@ def render_view(
     surface: str = SURFACE_LAMBERTIAN,
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
     cloud: CloudSource | None = None,
+    channel: str = CHANNEL_ALL,
 ) -> tuple[np.ndarray, float, float]:
     """Run one SMART-G 3D radiative-transfer view of the cloud field,
     centred on point_a_km, as seen from satellite_position_km, under a
@@ -376,8 +395,9 @@ def render_view(
     true_point_km (and turns by `footprint_rotation_rad`), viewed along the
     actual line of sight. The returned angles are then the actual ones.
 
-    `surface`/`wind_speed_ms`: see build_surface(). `cloud`: see
-    build_scene_3d() (default: the bundled cumulus field)."""
+    `surface`/`wind_speed_ms`: see build_surface(). `cloud`, `channel`: see
+    build_scene_3d() (default: the bundled cumulus field, all three bands).
+    The returned reflectance has one band per simulated wavelength."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -389,7 +409,7 @@ def render_view(
 
     lat_deg = main.geocentric_latitude_deg(point_a_km)
     wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
-        lat_deg, periodic, surface, wind_speed_ms, cloud
+        lat_deg, periodic, surface, wind_speed_ms, cloud, channel
     )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
@@ -446,6 +466,7 @@ def render_formation_frozen(
     surface: str = SURFACE_LAMBERTIAN,
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
     cloud: CloudSource | None = None,
+    channel: str = CHANNEL_ALL,
 ) -> dict[int, np.ndarray]:
     """Render the CloudCT formation's frozen-in-time geometry, exactly as
     main.py defines it (main.formation_positions_km(): satellite index
@@ -485,7 +506,7 @@ def render_formation_frozen(
 
     lat_deg = main.geocentric_latitude_deg(target_km)
     wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
-        lat_deg, periodic, surface, wind_speed_ms, cloud
+        lat_deg, periodic, surface, wind_speed_ms, cloud, channel
     )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
@@ -568,6 +589,11 @@ class PlaygroundConfig:
     # extinction coefficient) from Eq. 3 with Q = 2 ("q2") or the Mie Q of each
     # radius bin ("mie"), optionally cropped to a square of `bomex_crop_cells`
     # cells around the thickest column (0 = the whole field).
+    # Which wavelengths to simulate (see CHANNELS): "all" (the three bands of
+    # main.SMARTG_WAVELENGTHS_NM, the default) or one of "blue", "green", "red".
+    # A single channel gives grayscale PNGs.
+    channel: str = CHANNEL_ALL
+
     cloud_source: str = CLOUD_BUNDLED
     bomex_netcdf: str = ""
     extinction_method: str = cloud_microphysics.EXTINCTION_Q2
@@ -631,6 +657,8 @@ class PlaygroundConfig:
             raise ValueError("photons_per_pixel must be >= 1")
         if self.renders < 1:
             raise ValueError("renders must be >= 1")
+        if self.channel not in CHANNELS:
+            raise ValueError(f"channel must be one of {CHANNELS}, not {self.channel!r}")
         if self.cloud_source not in CLOUD_SOURCES:
             raise ValueError(f"cloud_source must be one of {CLOUD_SOURCES}, not {self.cloud_source!r}")
         if self.cloud_source == CLOUD_BOMEX and not self.bomex_netcdf.strip():
@@ -892,6 +920,10 @@ class PlaygroundSimulation:
             suffix += f"_hg{config.hg_g:g}"
         return suffix
 
+    def _channel_file_suffix(self, config: PlaygroundConfig) -> str:
+        """Names a single-channel render (_blue, _green, _red); empty for all."""
+        return "" if config.channel == CHANNEL_ALL else f"_{config.channel}"
+
     def _noise_file_suffix(self, config: PlaygroundConfig) -> str:
         if not config.pointing_noise_enabled:
             return ""
@@ -929,6 +961,7 @@ class PlaygroundSimulation:
             surface=config.surface,
             wind_speed_ms=config.wind_speed_ms,
             cloud=cloud,
+            channel=config.channel,
         )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
@@ -937,18 +970,21 @@ class PlaygroundSimulation:
             f"{'periodic' if config.periodic else 'nonperiodic'}"
             f"{self._surface_file_suffix(config)}"
             f"{self._cloud_file_suffix(config)}"
+            f"{self._channel_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}.png"
         )
         gain = config.display_gain
         main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
         np.save(path.with_suffix(".npy"), reflectance)  # raw, un-clipped
         figure_path = path.with_name(f"{path.stem}_raw.png")
-        save_reflectance_figure(reflectance, figure_path, path.stem, gain)
+        save_reflectance_figure(
+            reflectance, figure_path, path.stem, gain, channel_wavelengths_nm(config.channel)
+        )
         return (
             f"{pointing_summary}"
             f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
             f"saved {path} (+ .npy, {figure_path.name})\n"
-            f"Raw reflectance:\n{reflectance_stats(reflectance, gain)}"
+            f"Raw reflectance:\n{reflectance_stats(reflectance, gain, wavelengths_nm=channel_wavelengths_nm(config.channel))}"
         )
 
     def _render_formation(
@@ -989,12 +1025,14 @@ class PlaygroundSimulation:
             surface=config.surface,
             wind_speed_ms=config.wind_speed_ms,
             cloud=cloud,
+            channel=config.channel,
         )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
             f"{'periodic' if config.periodic else 'nonperiodic'}"
             f"{self._surface_file_suffix(config)}"
             f"{self._cloud_file_suffix(config)}"
+            f"{self._channel_file_suffix(config)}"
             f"{self._noise_file_suffix(config)}"
         )
         subdir.mkdir(parents=True, exist_ok=True)
@@ -1008,9 +1046,10 @@ class PlaygroundSimulation:
                 path.with_name(f"{path.stem}_raw.png"),
                 f"{subdir.name} / satellite {index}",
                 gain,
+                channel_wavelengths_nm(config.channel),
             )
             summaries.append(
-                f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain)}"
+                f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain, wavelengths_nm=channel_wavelengths_nm(config.channel))}"
             )
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])
 
@@ -1178,13 +1217,20 @@ def format_pixel_voxel_summary(
     )
 
 
-def reflectance_stats(reflectance: np.ndarray, gain: float, indent: str = "  ") -> str:
+def reflectance_stats(
+    reflectance: np.ndarray,
+    gain: float,
+    indent: str = "  ",
+    wavelengths_nm: np.ndarray | None = None,
+) -> str:
     """One line per wavelength band describing the raw reflectance (min,
     median, 99th percentile, max) and the share of pixels the PNG's display
     gain clips to pure white, so saturation can be judged without the
-    image."""
+    image. `wavelengths_nm` names the bands (default: all three of
+    main.SMARTG_WAVELENGTHS_NM)."""
+    wavelengths_nm = main.SMARTG_WAVELENGTHS_NM if wavelengths_nm is None else wavelengths_nm
     lines = []
-    for band, wavelength_nm in enumerate(main.SMARTG_WAVELENGTHS_NM):
+    for band, wavelength_nm in enumerate(wavelengths_nm):
         values = reflectance[..., band]
         q50, q99 = np.percentile(values, [50, 99])
         clipped = float(np.mean(values * gain >= 1.0))
@@ -1196,15 +1242,22 @@ def reflectance_stats(reflectance: np.ndarray, gain: float, indent: str = "  ") 
 
 
 def save_reflectance_figure(
-    reflectance: np.ndarray, path: Path, title: str, gain: float
+    reflectance: np.ndarray,
+    path: Path,
+    title: str,
+    gain: float,
+    wavelengths_nm: np.ndarray | None = None,
 ) -> None:
     """Save the raw reflectance as one heat map per wavelength band, in
     reflectance units on a shared 0-to-max colour scale (no display gain,
     gamma or clipping), with a colour bar each. Uses matplotlib's Agg
     canvas directly, so it needs no display and doesn't touch pyplot's
-    global backend."""
+    global backend. `wavelengths_nm` names the bands (default: all three of
+    main.SMARTG_WAVELENGTHS_NM)."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
+
+    wavelengths_nm = main.SMARTG_WAVELENGTHS_NM if wavelengths_nm is None else wavelengths_nm
 
     n_bands = reflectance.shape[-1]
     vmax = float(reflectance.max())
@@ -1213,7 +1266,7 @@ def save_reflectance_figure(
     axes = figure.subplots(1, n_bands, squeeze=False)[0]
     for band, axis in enumerate(axes):
         image = axis.imshow(reflectance[..., band], vmin=0.0, vmax=vmax, cmap="viridis")
-        axis.set_title(f"{main.SMARTG_WAVELENGTHS_NM[band]:.0f} nm")
+        axis.set_title(f"{wavelengths_nm[band]:.0f} nm")
         axis.set_xticks([])
         axis.set_yticks([])
         figure.colorbar(image, ax=axis, shrink=0.8, label="TOA reflectance")
@@ -1232,6 +1285,8 @@ def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> 
         f"Scenario: {config.mode}, satellite geometry at {simulation.time_utc} "
         f"(TLE: {config.tle.splitlines()[0].strip()})"
     )
+    wavelengths = ", ".join(f"{w:.0f}" for w in channel_wavelengths_nm(config.channel))
+    log(f"Channel: {config.channel} ({wavelengths} nm)")
     renders = config.renders
     if renders > 1 and not config.pointing_noise_enabled:
         log("Pointing error is off, so repeated renders would be identical: doing 1.")

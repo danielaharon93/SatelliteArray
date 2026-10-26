@@ -11,6 +11,7 @@ as the GUI names them. The config pins down the satellite geometry (time and
 TLE), so the render matches what the GUI would have produced.
 """
 
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,12 @@ from pathlib import Path
 # The scenario file to render. A relative path is taken relative to this
 # file's folder, not the directory the script happens to be launched from.
 CONFIG_PATH = "configs/scenario.json"
+
+# Which wavelengths to simulate. None uses the scenario file's own "channel"
+# setting (set in the GUI's "Color channel"); or override it here for this run:
+# "all" (blue, green and red: 440, 550 and 670 nm) or one of "blue", "green",
+# "red" (a single wavelength, written as a grayscale image).
+CHANNEL = None
 
 # No display on this kind of machine: keep Traits/Pyface on their no-GUI
 # backend instead of trying to start Qt. Must be set before they're imported.
@@ -52,6 +59,14 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(f"Could not load {config_path}: {exc}", file=sys.stderr)
         return 2
+
+    if CHANNEL is not None:
+        config = dataclasses.replace(config, channel=CHANNEL)
+        try:
+            config.validate()
+        except ValueError as exc:
+            print(f"Bad CHANNEL setting in {Path(__file__).name}: {exc}", file=sys.stderr)
+            return 2
 
     playground_core.run_config(config)
     return 0

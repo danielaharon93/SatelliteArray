@@ -81,6 +81,11 @@ directory; an absolute path also works. Progress and a per-render summary are
 printed; images are written to `smartg_playground_images/` next to the script.
 Exit code 2 means the config could not be loaded (the message says why).
 
+To simulate only one colour channel, set `channel` in the scenario (the GUI's "Color
+channel"), or override it for this run with `CHANNEL = "green"` (or `"blue"`, `"red"`,
+`"all"`) near the top of `run_from_config.py`; `CHANNEL = None` keeps the scenario's own
+setting. A bad value exits with code 2.
+
 Copy the images back from the server's `smartg_playground_images/` folder.
 
 ## The config file
@@ -102,6 +107,7 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `display_gain` | Brightness gain of the saved PNGs, `(gain × reflectance)^(1/1.8)` clipped to 1 (default 1.0: reflectance as it is, which keeps bright cloud pixels from saturating; the sea is dark). Only affects the PNG: the `.npy` next to it holds the raw reflectance. Raise it to brighten dark scenes. |
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
+| `channel` | Which wavelengths to simulate: `"all"` (default: blue, green and red, 440 / 550 / 670 nm) or one of `"blue"`, `"green"`, `"red"` (a single wavelength: the `.npy` has shape `(height, width, 1)` and the PNG is grayscale). Set it in the GUI with "Color channel", or override it for one headless run with `CHANNEL` in `run_from_config.py`. |
 | `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`) or `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)). |
 | `bomex_netcdf` | Path to the BOMEX `…com3D_int_2.nc` file (the one with the `FNCD` droplet spectrum). Required for `"bomex"`. |
 | `extinction_method` | `"q2"` (default: extinction with Q = 2, the paper's approximation) or `"mie"` (the Mie Q of each radius bin). Only used by `"bomex"`. |
@@ -214,9 +220,9 @@ shifted footprints fit.
 
 ### Output names
 
-Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>].png` (+ `.npy`)
+Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_<blue|green|red>][_noise_seed<S>_render<k>].png` (+ `.npy`)
 
-Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_noise_seed<S>_render<k>]/`
+Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_<blue|green|red>][_noise_seed<S>_render<k>]/`
 containing `satellite_<NN>.png` (+ `.npy`, `_raw.png`) per rendered satellite.
 
 Each image also gets `<name>_raw.png`: one heat map per wavelength of the raw reflectance
@@ -228,7 +234,7 @@ Each PNG has a `.npy` file of the same name next to it holding the raw reflectan
 the display gain, gamma and clipping that turn it into the PNG (which saturates bright
 clouds). It is a float array of shape `(height, width, 3)`, rows top to bottom, with the
 last axis in the order of `main.SMARTG_WAVELENGTHS_NM` - 440, 550, 670 nm, i.e. **B, G, R**,
-not RGB. Load it with `numpy.load`; to rebuild an image with another gain:
+not RGB. With a single `channel` the array is `(height, width, 1)`. Load it with `numpy.load`; to rebuild an image with another gain:
 
 ```python
 import numpy as np, main

@@ -72,6 +72,7 @@ from traitsui.api import CheckListEditor, HGroup, Item, VGroup, View
 import main
 import pointing_noise
 from playground_core import (
+    CHANNELS,
     CLOUD_SOURCES,
     CONFIG_DIR,
     DEFAULT_HG_G,
@@ -136,6 +137,9 @@ class SmartgPlayground(HasTraits):
 
     # The 3D cloud (see playground_core.PlaygroundConfig): SMART-G's bundled
     # cumulus field, or one built from a BOMEX droplet-spectrum dataset.
+    # Which wavelengths to simulate (see playground_core.CHANNELS).
+    channel = Enum(list(CHANNELS))
+
     cloud_source = Enum(list(CLOUD_SOURCES))
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
@@ -210,6 +214,14 @@ class SmartgPlayground(HasTraits):
                     "wind_speed_ms",
                     label="Wind speed (m/s)",
                     enabled_when="surface == 'ocean'",
+                ),
+                Item(
+                    "channel",
+                    label="Color channel",
+                    tooltip=(
+                        "all: blue, green and red (440, 550, 670 nm); or just one of them, "
+                        "which gives a grayscale image"
+                    ),
                 ),
             ),
             HGroup(
@@ -593,6 +605,7 @@ class SmartgPlayground(HasTraits):
             display_gain=self.display_gain,
             resolution=self.resolution,
             photons_per_pixel=self.photons_per_pixel,
+            channel=self.channel,
             cloud_source=self.cloud_source,
             bomex_netcdf=self.bomex_netcdf.strip(),
             extinction_method=self.extinction_method,
@@ -622,6 +635,7 @@ class SmartgPlayground(HasTraits):
         self.display_gain = config.display_gain
         self.resolution = config.resolution
         self.photons_per_pixel = config.photons_per_pixel
+        self.channel = config.channel
         self.cloud_source = config.cloud_source
         self.bomex_netcdf = config.bomex_netcdf
         self.extinction_method = config.extinction_method

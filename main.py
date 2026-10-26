@@ -1280,8 +1280,12 @@ def reflectance_to_image(
     displayable 8-bit RGB image: pick out (red, green, blue) via
     SMARTG_RGB_CHANNEL_ORDER, apply a brightness `gain` and a display
     `gamma` correction (`output = (gain * reflectance) ** (1 / gamma)`),
-    then clip to [0, 1] and scale to [0, 255]."""
-    rgb = reflectance[..., SMARTG_RGB_CHANNEL_ORDER]
+    then clip to [0, 1] and scale to [0, 255]. A single-wavelength array
+    (h, w, 1) gives a grayscale image (the one band in all three colours)."""
+    if reflectance.shape[-1] == 1:
+        rgb = np.repeat(reflectance, 3, axis=-1)
+    else:
+        rgb = reflectance[..., SMARTG_RGB_CHANNEL_ORDER]
     scaled = np.clip(rgb * gain, 0.0, None) ** (1.0 / gamma)
     scaled = np.clip(scaled, 0.0, 1.0)
     return Image.fromarray((scaled * 255).astype(np.uint8), mode="RGB")
