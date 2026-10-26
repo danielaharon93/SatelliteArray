@@ -84,7 +84,8 @@ Exit code 2 means the config could not be loaded (the message says why).
 To simulate only one colour channel, set `channel` in the scenario (the GUI's "Color
 channel"), or override it for this run with `CHANNEL = "green"` (or `"blue"`, `"red"`,
 `"all"`) near the top of `run_from_config.py`; `CHANNEL = None` keeps the scenario's own
-setting. A bad value exits with code 2.
+setting. A bad value exits with code 2. `BAND_SET = "modis"` (or `"rgb"`) overrides the scenario's
+`band_set` the same way (see [Band sets](#band-sets)).
 
 Copy the images back from the server's `smartg_playground_images/` folder.
 
@@ -108,6 +109,7 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
 | `channel` | Which wavelengths to simulate: `"all"` (default: blue, green and red, 440 / 550 / 670 nm) or one of `"blue"`, `"green"`, `"red"` (a single wavelength: the `.npy` has shape `(height, width, 1)` and the PNG is grayscale). Set it in the GUI with "Color channel", or override it for one headless run with `CHANNEL` in `run_from_config.py`. |
+| `band_set` | What a channel is: `"rgb"` (default: single wavelengths, 440 / 550 / 670 nm) or `"modis"` (the MODIS Terra channels b03 blue 456-474 nm, b04 green 545-565 nm and b01 red 625-667 nm, simulated as SMART-G REPTRAN bands, see [Band sets](#band-sets)). Set it in the GUI with "Band set", or override it for one headless run with `BAND_SET` in `run_from_config.py`. |
 | `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`) or `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)). |
 | `bomex_netcdf` | Path to the BOMEX `…com3D_int_2.nc` file (the one with the `FNCD` droplet spectrum). Required for `"bomex"`. |
 | `extinction_method` | `"q2"` (default: extinction with Q = 2, the paper's approximation) or `"mie"` (the Mie Q of each radius bin). Only used by `"bomex"`. |
@@ -149,6 +151,25 @@ writing the images to `bomex_runs/<dataset name>/`. Files without `FNCD` are ski
 failing file does not stop the others, and the exit code is 1 if any failed. The phase
 function is always SMART-G's Mie one. With `RENDER = False` it only builds the cloud
 files, which needs no GPU.
+
+### Band sets
+
+`band_set` decides what each image channel is.
+
+- `"rgb"` (default): three single wavelengths, 440 nm (blue), 550 nm (green) and 670 nm (red).
+- `"modis"`: the MODIS Terra channels b03 (blue, 456-474 nm), b04 (green, 545-565 nm) and b01 (red,
+  625-667 nm), simulated as REPTRAN bands. REPTRAN is SMART-G's way of simulating a band: it replaces the
+  band by a few representative wavelengths, with weights, that together give the band-integrated gas
+  absorption. A channel's reflectance is the weighted mean of its representative wavelengths, weighted by the
+  band's weights and the solar irradiance there. Each of these three visible MODIS channels has a single
+  representative wavelength (464.8, 555.3 and 645.9 nm), so a render costs the same as in `"rgb"`, and in the
+  tests the result at those wavelengths simulated one by one agreed with the REPTRAN result to within the
+  Monte Carlo noise. The band data (`reptran/reptran_solar_modis.cdf` and its gas tables) must be in the SMART-G
+  auxiliary data.
+
+`channel` picks all three channels or one of them in either band set. The raw-reflectance figure and the printed
+statistics name the bands (for example `MODIS b03 (456-474 nm)`). Only the spectral side of a camera is
+modelled: there is no sensor blur, noise or calibration.
 
 ### Geometry is pinned
 
@@ -220,9 +241,9 @@ shifted footprints fit.
 
 ### Output names
 
-Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_<blue|green|red>][_noise_seed<S>_render<k>].png` (+ `.npy`)
+Single: `single_offnadir<N>_az<N>_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_modis][_<blue|green|red>][_noise_seed<S>_render<k>].png` (+ `.npy`)
 
-Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_<blue|green|red>][_noise_seed<S>_render<k>]/`
+Formation: a folder `formation_sza<N>_saa<N>_<periodic|nonperiodic>[_ocean<W>ms][_modis][_<blue|green|red>][_noise_seed<S>_render<k>]/`
 containing `satellite_<NN>.png` (+ `.npy`, `_raw.png`) per rendered satellite.
 
 Each image also gets `<name>_raw.png`: one heat map per wavelength of the raw reflectance

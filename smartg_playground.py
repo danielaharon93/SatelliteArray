@@ -72,6 +72,7 @@ from traitsui.api import CheckListEditor, HGroup, Item, VGroup, View
 import main
 import pointing_noise
 from playground_core import (
+    BAND_SETS,
     CHANNELS,
     CLOUD_SOURCES,
     CONFIG_DIR,
@@ -139,6 +140,8 @@ class SmartgPlayground(HasTraits):
     # cumulus field, or one built from a BOMEX droplet-spectrum dataset.
     # Which wavelengths to simulate (see playground_core.CHANNELS).
     channel = Enum(list(CHANNELS))
+    # What a channel is: single wavelengths, or MODIS channels (see BAND_SETS).
+    band_set = Enum(list(BAND_SETS))
 
     cloud_source = Enum(list(CLOUD_SOURCES))
     bomex_netcdf = Str()
@@ -214,6 +217,14 @@ class SmartgPlayground(HasTraits):
                     "wind_speed_ms",
                     label="Wind speed (m/s)",
                     enabled_when="surface == 'ocean'",
+                ),
+                Item(
+                    "band_set",
+                    label="Band set",
+                    tooltip=(
+                        "rgb: single wavelengths (440, 550, 670 nm); modis: the MODIS Terra "
+                        "channels b03, b04, b01, simulated as REPTRAN bands"
+                    ),
                 ),
                 Item(
                     "channel",
@@ -606,6 +617,7 @@ class SmartgPlayground(HasTraits):
             resolution=self.resolution,
             photons_per_pixel=self.photons_per_pixel,
             channel=self.channel,
+            band_set=self.band_set,
             cloud_source=self.cloud_source,
             bomex_netcdf=self.bomex_netcdf.strip(),
             extinction_method=self.extinction_method,
@@ -636,6 +648,7 @@ class SmartgPlayground(HasTraits):
         self.resolution = config.resolution
         self.photons_per_pixel = config.photons_per_pixel
         self.channel = config.channel
+        self.band_set = config.band_set
         self.cloud_source = config.cloud_source
         self.bomex_netcdf = config.bomex_netcdf
         self.extinction_method = config.extinction_method

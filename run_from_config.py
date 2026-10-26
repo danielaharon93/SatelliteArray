@@ -26,6 +26,11 @@ CONFIG_PATH = "configs/scenario.json"
 # "red" (a single wavelength, written as a grayscale image).
 CHANNEL = None
 
+# What a channel is: "rgb" (single wavelengths: 440, 550 and 670 nm) or "modis"
+# (the MODIS Terra channels b03, b04 and b01, simulated as REPTRAN bands). None
+# uses the scenario file's own "band_set" setting.
+BAND_SET = None
+
 # No display on this kind of machine: keep Traits/Pyface on their no-GUI
 # backend instead of trying to start Qt. Must be set before they're imported.
 os.environ.setdefault("ETS_TOOLKIT", "null")
@@ -60,12 +65,13 @@ def main() -> int:
         print(f"Could not load {config_path}: {exc}", file=sys.stderr)
         return 2
 
-    if CHANNEL is not None:
-        config = dataclasses.replace(config, channel=CHANNEL)
+    overrides = {name: value for name, value in (("channel", CHANNEL), ("band_set", BAND_SET)) if value is not None}
+    if overrides:
+        config = dataclasses.replace(config, **overrides)
         try:
             config.validate()
         except ValueError as exc:
-            print(f"Bad CHANNEL setting in {Path(__file__).name}: {exc}", file=sys.stderr)
+            print(f"Bad CHANNEL / BAND_SET setting in {Path(__file__).name}: {exc}", file=sys.stderr)
             return 2
 
     playground_core.run_config(config)
