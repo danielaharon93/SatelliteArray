@@ -156,6 +156,10 @@ class Spectrum:
     # photons that each wavelength gets.
     wavelength_proba: np.ndarray | None = None
     sampling: np.ndarray | None = None
+    # Grid band set only, for the wavelength-distribution figure: the mean solar
+    # irradiance (mW m-2 nm-1) and the width (nm) of each wavelength's bin.
+    solar: np.ndarray | None = None
+    bin_width: np.ndarray | None = None
     # Decimals to which the droplet radius is rounded when SMART-G picks the cloud's
     # phase matrices (None: main.SMARTG_3D_CLOUD_REFF_ACC). SMART-G computes one
     # phase matrix per wavelength and per distinct radius, so many wavelengths
@@ -263,15 +267,18 @@ def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_n
     low, high = grid_range_nm
     third = (high - low) / 3.0
     wanted = [name for name in CHANNEL_BAND if channel in (CHANNEL_ALL, name)]  # blue, green, red
-    centres, group, weight, share, labels = [], [], [], [], []
+    centres, group, weight, share, labels, solar, width = [], [], [], [], [], [], []
     for k, name in enumerate(wanted):
         index = list(CHANNEL_BAND).index(name)
         start, stop = low + index * third, low + (index + 1) * third
         n_bins = max(1, int(round((stop - start) / grid_step_nm)))
         edges = np.linspace(start, stop, n_bins + 1)
         mid = 0.5 * (edges[:-1] + edges[1:])
-        w = camera_response(mid) * solar_irradiance_bins(tuple(float(e) for e in edges)) * np.diff(edges)
+        irradiance = solar_irradiance_bins(tuple(float(e) for e in edges))
+        w = camera_response(mid) * irradiance * np.diff(edges)
         centres += mid.tolist()
+        solar += irradiance.tolist()
+        width += np.diff(edges).tolist()
         group += [k] * n_bins
         weight += w.tolist()
         share += (w / w.sum() / len(wanted)).tolist()
@@ -284,6 +291,8 @@ def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_n
         np.array(weight),
         icdf(share).astype(np.int64),
         share,
+        np.array(solar),
+        np.array(width),
         reff_acc=GRID_REFF_ACC,
     )
 
@@ -1167,6 +1176,9 @@ class PlaygroundSimulation:
             channel_of_wavelength=spectrum.group,
             channel_labels=np.array(spectrum.labels),
         )
+        save_wavelength_distribution_figure(
+            spectrum, png_path.with_name(f"{png_path.stem}_wavelength_distribution.svg")
+        )
 
     def _channel_file_suffix(self, config: PlaygroundConfig) -> str:
         """Names the band set (_modis) and a single-channel render (_blue, _green,
@@ -1532,6 +1544,37 @@ def save_reflectance_figure(
         figure.colorbar(image, ax=axis, shrink=0.8, label="TOA reflectance")
     figure.suptitle(f"{title}  (raw; PNG gain {gain:g} clips at {1 / gain:.3g})")
     figure.savefig(path, dpi=110)
+
+
+def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path) -> None:
+    """Save, as a vector graphic (SVG), the wavelength distribution of the "grid"
+    band set: the solar irradiance in each wavelength bin (top) and the share of
+    the photons that SMART-G draws at each wavelength (bottom), with the bars
+    coloured by channel. Uses matplotlib's Agg canvas directly, so it needs no
+    display."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    wavelength = np.asarray(spectrum.run_wavelength, float)
+    colours = ("tab:blue", "tab:green", "tab:red")
+    figure = Figure(figsize=(8.0, 6.0), layout="constrained")
+    FigureCanvasAgg(figure)
+    top, bottom = figure.subplots(2, 1, sharex=True)
+    for channel, label in enumerate(spectrum.labels):
+        mine = spectrum.group == channel
+        colour = colours[channel]
+        top.bar(wavelength[mine], spectrum.solar[mine], width=spectrum.bin_width[mine], color=colour, alpha=0.8, label=label)
+        bottom.bar(wavelength[mine], 100.0 * spectrum.sampling[mine], width=spectrum.bin_width[mine], color=colour, alpha=0.8)
+    top.set_ylabel("Solar irradiance (mW m$^{-2}$ nm$^{-1}$)")
+    top.set_title("Extraterrestrial solar irradiance, mean per wavelength bin")
+    top.legend(title="channel")
+    bottom.set_ylabel("Share of photons (%)")
+    bottom.set_xlabel("Wavelength (nm)")
+    bottom.set_title("Photon wavelength distribution (response x irradiance x bin width)")
+    top.set_ylim(0.0, 1.35 * float(spectrum.solar.max()))  # room for the legend
+    for axis in (top, bottom):
+        axis.grid(alpha=0.3)
+    figure.savefig(path, format="svg")
 
 
 def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> None:

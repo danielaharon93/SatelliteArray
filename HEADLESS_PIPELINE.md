@@ -178,7 +178,8 @@ files, which needs no GPU.
   simulated with all of its photons. Besides the image, the reflectance at every wavelength is saved in
   `<name>_spectral.npz` (`reflectance` of shape (height, width, n_wavelengths), `wavelength_nm`, `sampling_probability`,
   `channel_weight`, `channel_of_wavelength`, `channel_labels`), so that another camera response or sun spectrum can be applied
-  later without a new render. A single wavelength is noisy (it got only a small share of the photons); only the weighted sums
+  later without a new render. `<name>_wavelength_distribution.svg` (a vector graphic) shows the solar irradiance per
+  wavelength bin and the share of the photons each wavelength gets. A single wavelength is noisy (it got only a small share of the photons); only the weighted sums
   over a channel are smooth. Memory: SMART-G builds one phase matrix per wavelength and per distinct droplet radius, so
   this band set rounds the radius to 1 um (the spacing of SMART-G's cloud table) instead of 0.1 um; at 0.1 um a 30-wavelength
   run needs about 24 GB of host memory.
