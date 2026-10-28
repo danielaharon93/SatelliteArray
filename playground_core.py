@@ -105,7 +105,18 @@ CHANNELS = (CHANNEL_ALL, *CHANNEL_BAND)
 # (red); each is one representative wavelength.
 BAND_SET_RGB = "rgb"
 BAND_SET_MODIS = "modis"
-BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS)
+# A grid of wavelengths over the camera's range, sampled the way a band is: each
+# photon gets a wavelength drawn from the distribution camera response x solar
+# irradiance (SMART-G's `wavelength_proba`), and a channel is the weighted mean
+# over its wavelengths (see make_spectrum()). The range is split into equal
+# thirds for the blue, green and red channels.
+BAND_SET_GRID = "grid"
+BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS, BAND_SET_GRID)
+GRID_DEFAULT_RANGE_NM = (400.0, 700.0)
+GRID_DEFAULT_STEP_NM = 10.0
+GRID_MIN_NM, GRID_MAX_NM = 300.0, 4000.0  # inside the water-cloud table's 253-4441 nm
+SOLAR_REPTRAN_FILE = "reptran_solar_coarse"  # its `extra` is the solar irradiance
+GRID_REFF_ACC = 0  # droplet radius rounded to 1 um in the grid band set, see Spectrum.reff_acc
 MODIS_REPTRAN_FILE = "reptran_solar_modis"
 MODIS_CHANNELS = {"blue": "modis_terra_b03", "green": "modis_terra_b04", "red": "modis_terra_b01"}
 
@@ -140,6 +151,17 @@ class Spectrum:
     run_wavelength: object
     group: np.ndarray | None = None
     weight: np.ndarray | None = None
+    # Grid band set only: the inverse CDF that SMART-G draws each photon's
+    # wavelength from (`wavelength_proba`), and the resulting share of the
+    # photons that each wavelength gets.
+    wavelength_proba: np.ndarray | None = None
+    sampling: np.ndarray | None = None
+    # Decimals to which the droplet radius is rounded when SMART-G picks the cloud's
+    # phase matrices (None: main.SMARTG_3D_CLOUD_REFF_ACC). SMART-G computes one
+    # phase matrix per wavelength and per distinct radius, so many wavelengths
+    # with radii rounded to 0.1 um need tens of GB; the grid band set rounds to
+    # 1 um, the spacing of SMART-G's own water-cloud table.
+    reff_acc: int | None = None
 
     @property
     def n_channels(self) -> int:
@@ -158,15 +180,49 @@ class Spectrum:
         return out
 
 
-@functools.lru_cache(maxsize=16)
-def make_spectrum(band_set: str = BAND_SET_RGB, channel: str = CHANNEL_ALL) -> Spectrum:
-    """The Spectrum for a `band_set` ("rgb" or "modis") and a `channel`
-    ("all", or one of "blue", "green", "red")."""
+def camera_response(wavelength_nm: np.ndarray) -> np.ndarray:
+    """The camera's spectral response at the given wavelengths, for the "grid"
+    band set. Uniform for now (the camera is assumed to respond equally over
+    its whole range); replace the body, e.g. with an interpolated curve, to use
+    a real camera. Only relative values matter."""
+    return np.ones_like(np.asarray(wavelength_nm, dtype=float))
+
+
+@functools.lru_cache(maxsize=32)
+def solar_irradiance_bins(edges_nm: tuple[float, ...]) -> np.ndarray:
+    """Mean extraterrestrial solar irradiance (mW m-2 nm-1) in each wavelength
+    bin [edges[i], edges[i+1]), from the `extra` values that SMART-G's solar
+    REPTRAN file stores at its representative wavelengths (a bin with none uses
+    the interpolated value at its centre). Only relative values are used."""
+    from smartg.reptran import Reptran
+
+    reptran = Reptran(SOLAR_REPTRAN_FILE)
+    order = np.argsort(reptran.wvl)
+    wvl, extra = np.asarray(reptran.wvl, float)[order], np.asarray(reptran.extra, float)[order]
+    out = []
+    for lo, hi in zip(edges_nm[:-1], edges_nm[1:]):
+        inside = (wvl >= lo) & (wvl < hi)
+        out.append(extra[inside].mean() if inside.any() else float(np.interp(0.5 * (lo + hi), wvl, extra)))
+    return np.array(out)
+
+
+@functools.lru_cache(maxsize=32)
+def make_spectrum(
+    band_set: str = BAND_SET_RGB,
+    channel: str = CHANNEL_ALL,
+    grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
+    grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+) -> Spectrum:
+    """The Spectrum for a `band_set` ("rgb", "modis" or "grid") and a `channel`
+    ("all", or one of "blue", "green", "red"). `grid_range_nm` and `grid_step_nm`
+    only matter for the "grid" band set; pass the range as a tuple."""
     if channel not in CHANNELS:
         raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
     if band_set == BAND_SET_RGB:
         wavelengths = channel_wavelengths_nm(channel)
         return Spectrum(tuple(f"{w:.0f} nm" for w in wavelengths), wavelengths)
+    if band_set == BAND_SET_GRID:
+        return _grid_spectrum(channel, tuple(grid_range_nm), float(grid_step_nm))
     if band_set != BAND_SET_MODIS:
         raise ValueError(f"band_set must be one of {BAND_SETS}, not {band_set!r}")
 
@@ -189,6 +245,54 @@ def make_spectrum(band_set: str = BAND_SET_RGB, channel: str = CHANNEL_ALL) -> S
         band = reptran.band(by_name[MODIS_CHANNELS[name]])
         labels.append(f"MODIS {MODIS_CHANNELS[name][-3:]} ({band.wmin:.0f}-{band.wmax:.0f} nm)")
     return Spectrum(tuple(labels), BandSet(internal), group, weight)
+
+
+def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_nm: float) -> Spectrum:
+    """The "grid" band set: the camera range, split into equal thirds (blue,
+    green, red), each divided into bins of about `grid_step_nm`; one wavelength
+    per bin, at its centre.
+
+    A channel's reflectance is sum(w * reflectance) / sum(w) over its
+    wavelengths, with w = response x solar irradiance x bin width. The photons'
+    wavelengths are drawn with probability proportional to those weights (within
+    a channel, and equally between the channels that are simulated): this
+    importance sampling gives each channel the precision of a single wavelength
+    simulated with all of its photons."""
+    from smartg.cdf import icdf
+
+    low, high = grid_range_nm
+    third = (high - low) / 3.0
+    wanted = [name for name in CHANNEL_BAND if channel in (CHANNEL_ALL, name)]  # blue, green, red
+    centres, group, weight, share, labels = [], [], [], [], []
+    for k, name in enumerate(wanted):
+        index = list(CHANNEL_BAND).index(name)
+        start, stop = low + index * third, low + (index + 1) * third
+        n_bins = max(1, int(round((stop - start) / grid_step_nm)))
+        edges = np.linspace(start, stop, n_bins + 1)
+        mid = 0.5 * (edges[:-1] + edges[1:])
+        w = camera_response(mid) * solar_irradiance_bins(tuple(float(e) for e in edges)) * np.diff(edges)
+        centres += mid.tolist()
+        group += [k] * n_bins
+        weight += w.tolist()
+        share += (w / w.sum() / len(wanted)).tolist()
+        labels.append(f"grid {start:.0f}-{stop:.0f} nm")
+    share = np.array(share)
+    return Spectrum(
+        tuple(labels),
+        np.array(centres),
+        np.array(group),
+        np.array(weight),
+        icdf(share).astype(np.int64),
+        share,
+        reff_acc=GRID_REFF_ACC,
+    )
+
+
+def config_spectrum(config: "PlaygroundConfig") -> Spectrum:
+    """The Spectrum a config asks for: its band set, channel and grid settings."""
+    return make_spectrum(
+        config.band_set, config.channel, tuple(config.grid_range_nm), float(config.grid_step_nm)
+    )
 
 
 def viewing_direction_km(
@@ -339,6 +443,7 @@ def build_scene_3d(
     from smartg.grid3d import Grid3D
 
     cloud = cloud or bundled_cloud()
+    spectrum = spectrum or make_spectrum()
     if not cloud.dat_path.exists():
         raise FileNotFoundError(
             f"{cloud.dat_path} not found; the bundled cumulus.dat is downloaded with "
@@ -355,7 +460,7 @@ def build_scene_3d(
         main.SMARTG_CLOUD_FNAME,
         w_ref=main.SMARTG_3D_CLOUD_W_REF_NM,
         ds=field,
-        reff_acc=main.SMARTG_3D_CLOUD_REFF_ACC,
+        reff_acc=main.SMARTG_3D_CLOUD_REFF_ACC if spectrum.reff_acc is None else spectrum.reff_acc,
         reff_min=main.SMARTG_3D_CLOUD_REFF_MIN_UM,
         phase=phase,
     )
@@ -371,7 +476,7 @@ def build_scene_3d(
     atm_1d = Atm1D(main.SMARTG_AFGL_PROFILE, lat=lat_deg)
     atmosphere = Atm3D(atm_1d=atm_1d, grid_3d=grid_3d, comp_3d=[cloud_3d])
     surface = build_surface(surface, wind_speed_ms)
-    return (spectrum or make_spectrum()).run_wavelength, atmosphere, surface, grid_3d
+    return spectrum.run_wavelength, atmosphere, surface, grid_3d
 
 
 def footprint_sensors(
@@ -460,6 +565,9 @@ def render_view(
     cloud: CloudSource | None = None,
     channel: str = CHANNEL_ALL,
     band_set: str = BAND_SET_RGB,
+    grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
+    grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    spectral_out: dict | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """Run one SMART-G 3D radiative-transfer view of the cloud field,
     centred on point_a_km, as seen from satellite_position_km, under a
@@ -482,9 +590,11 @@ def render_view(
     actual line of sight. The returned angles are then the actual ones.
 
     `surface`/`wind_speed_ms`: see build_surface(). `cloud`: see build_scene_3d()
-    (default: the bundled cumulus field). `band_set` and `channel` choose what is
-    simulated, see make_spectrum(); the returned reflectance has one band per
-    channel."""
+    (default: the bundled cumulus field). `band_set`, `channel`, `grid_range_nm`
+    and `grid_step_nm` choose what is simulated, see make_spectrum(); the
+    returned reflectance has one band per channel. If `spectral_out` is a dict,
+    the reflectance at every simulated wavelength, (height, width, n_wavelengths),
+    is stored in it under "single"."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -495,7 +605,7 @@ def render_view(
     cloud = cloud or bundled_cloud()
 
     lat_deg = main.geocentric_latitude_deg(point_a_km)
-    spectrum = make_spectrum(band_set, channel)
+    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
     wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
         lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum
     )
@@ -528,6 +638,7 @@ def render_view(
 
     ds = Smartg(back=True, opt3d=True).run(
         wavelength=wavelength_nm,
+        wavelength_proba=spectrum.wavelength_proba,
         atmosphere=atmosphere_profile,
         surface=surface,
         sensor=sensors,
@@ -537,6 +648,8 @@ def render_view(
     )
     toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
     reflectance = spectrum.channels(toa_reflectance.values).reshape(height_px, width_px, spectrum.n_channels)
+    if spectral_out is not None:
+        spectral_out["single"] = np.asarray(toa_reflectance.values).reshape(height_px, width_px, -1)
     return reflectance, vza_deg, vaa_deg
 
 
@@ -556,6 +669,9 @@ def render_formation_frozen(
     cloud: CloudSource | None = None,
     channel: str = CHANNEL_ALL,
     band_set: str = BAND_SET_RGB,
+    grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
+    grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    spectral_out: dict | None = None,
 ) -> dict[int, np.ndarray]:
     """Render the CloudCT formation's frozen-in-time geometry, exactly as
     main.py defines it (main.formation_positions_km(): satellite index
@@ -594,7 +710,7 @@ def render_formation_frozen(
     cloud = cloud or bundled_cloud()
 
     lat_deg = main.geocentric_latitude_deg(target_km)
-    spectrum = make_spectrum(band_set, channel)
+    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
     wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
         lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum
     )
@@ -632,6 +748,7 @@ def render_formation_frozen(
         )
         ds = sg.run(
             wavelength=wavelength_nm,
+            wavelength_proba=spectrum.wavelength_proba,
             atmosphere=atmosphere_profile,
             surface=surface,
             sensor=sensors,
@@ -643,6 +760,8 @@ def render_formation_frozen(
         images[index] = spectrum.channels(toa_reflectance.values).reshape(
             height_px, width_px, spectrum.n_channels
         )
+        if spectral_out is not None:
+            spectral_out[index] = np.asarray(toa_reflectance.values).reshape(height_px, width_px, -1)
 
     return images
 
@@ -688,6 +807,10 @@ class PlaygroundConfig:
     # What a channel is (see BAND_SETS): "rgb" (single wavelengths: 440, 550, 670 nm)
     # or "modis" (the MODIS Terra channels b03, b04, b01, as REPTRAN bands).
     band_set: str = BAND_SET_RGB
+    # The "grid" band set: the camera's wavelength range (split into equal thirds
+    # for blue, green and red) and the bin width of the wavelength grid.
+    grid_range_nm: list[float] = field(default_factory=lambda: list(GRID_DEFAULT_RANGE_NM))
+    grid_step_nm: float = GRID_DEFAULT_STEP_NM
 
     cloud_source: str = CLOUD_BUNDLED
     bomex_netcdf: str = ""
@@ -756,6 +879,12 @@ class PlaygroundConfig:
             raise ValueError(f"channel must be one of {CHANNELS}, not {self.channel!r}")
         if self.band_set not in BAND_SETS:
             raise ValueError(f"band_set must be one of {BAND_SETS}, not {self.band_set!r}")
+        if len(self.grid_range_nm) != 2 or not GRID_MIN_NM <= self.grid_range_nm[0] < self.grid_range_nm[1] <= GRID_MAX_NM:
+            raise ValueError(
+                f"grid_range_nm must be [low, high] with {GRID_MIN_NM:g} <= low < high <= {GRID_MAX_NM:g}"
+            )
+        if not 0 < self.grid_step_nm <= (self.grid_range_nm[1] - self.grid_range_nm[0]) / 3:
+            raise ValueError("grid_step_nm must be > 0 and at most a third of the grid range")
         if self.cloud_source not in CLOUD_SOURCES:
             raise ValueError(f"cloud_source must be one of {CLOUD_SOURCES}, not {self.cloud_source!r}")
         if self.cloud_source == CLOUD_BOMEX and not self.bomex_netcdf.strip():
@@ -1017,6 +1146,28 @@ class PlaygroundSimulation:
             suffix += f"_hg{config.hg_g:g}"
         return suffix
 
+    def _save_spectral(self, config: PlaygroundConfig, cube: np.ndarray | None, png_path: Path) -> None:
+        """For the "grid" band set, save the reflectance at every simulated
+        wavelength next to the image (<name>_spectral.npz), so that another
+        camera response or sun spectrum can be applied later without a new
+        render. The arrays: `reflectance` (height, width, n_wavelengths),
+        `wavelength_nm`, `sampling_probability` (the share of the photons each
+        wavelength got), `channel_weight` and `channel_of_wavelength` (how the
+        channels were combined) and `channel_labels`. A wavelength that got few
+        photons is noisy; only the weighted sums over a channel are smooth."""
+        if config.band_set != BAND_SET_GRID or cube is None:
+            return
+        spectrum = config_spectrum(config)
+        np.savez_compressed(
+            png_path.with_name(f"{png_path.stem}_spectral.npz"),
+            reflectance=cube.astype(np.float32),
+            wavelength_nm=spectrum.run_wavelength,
+            sampling_probability=spectrum.sampling,
+            channel_weight=spectrum.weight,
+            channel_of_wavelength=spectrum.group,
+            channel_labels=np.array(spectrum.labels),
+        )
+
     def _channel_file_suffix(self, config: PlaygroundConfig) -> str:
         """Names the band set (_modis) and a single-channel render (_blue, _green,
         _red); empty for the original settings."""
@@ -1046,6 +1197,7 @@ class PlaygroundSimulation:
             )
             pointing_summary += "  |  "
 
+        spectral: dict = {}
         reflectance, vza_deg, vaa_deg = render_view(
             self.position_km,
             point_a_km,
@@ -1062,6 +1214,9 @@ class PlaygroundSimulation:
             cloud=cloud,
             channel=config.channel,
             band_set=config.band_set,
+            grid_range_nm=tuple(config.grid_range_nm),
+            grid_step_nm=config.grid_step_nm,
+            spectral_out=spectral,
         )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
@@ -1076,15 +1231,16 @@ class PlaygroundSimulation:
         gain = config.display_gain
         main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
         np.save(path.with_suffix(".npy"), reflectance)  # raw, un-clipped
+        self._save_spectral(config, spectral.get("single"), path)
         figure_path = path.with_name(f"{path.stem}_raw.png")
         save_reflectance_figure(
-            reflectance, figure_path, path.stem, gain, make_spectrum(config.band_set, config.channel).labels
+            reflectance, figure_path, path.stem, gain, config_spectrum(config).labels
         )
         return (
             f"{pointing_summary}"
             f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
             f"saved {path} (+ .npy, {figure_path.name})\n"
-            f"Raw reflectance:\n{reflectance_stats(reflectance, gain, labels=make_spectrum(config.band_set, config.channel).labels)}"
+            f"Raw reflectance:\n{reflectance_stats(reflectance, gain, labels=config_spectrum(config).labels)}"
         )
 
     def _render_formation(
@@ -1111,6 +1267,7 @@ class PlaygroundSimulation:
                 pointing[index] = (true_point_km, rotation_rad)
                 summaries.append(f"Sat {index}: {summary}")
 
+        spectral: dict = {}
         images = render_formation_frozen(
             self.formation_target_km,
             self.formation_positions_km,
@@ -1127,6 +1284,9 @@ class PlaygroundSimulation:
             cloud=cloud,
             channel=config.channel,
             band_set=config.band_set,
+            grid_range_nm=tuple(config.grid_range_nm),
+            grid_step_nm=config.grid_step_nm,
+            spectral_out=spectral,
         )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
@@ -1142,15 +1302,16 @@ class PlaygroundSimulation:
             path = subdir / f"satellite_{index:02d}.png"
             main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
             np.save(path.with_suffix(".npy"), images[index])  # raw, un-clipped
+            self._save_spectral(config, spectral.get(index), path)
             save_reflectance_figure(
                 images[index],
                 path.with_name(f"{path.stem}_raw.png"),
                 f"{subdir.name} / satellite {index}",
                 gain,
-                make_spectrum(config.band_set, config.channel).labels,
+                config_spectrum(config).labels,
             )
             summaries.append(
-                f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain, labels=make_spectrum(config.band_set, config.channel).labels)}"
+                f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain, labels=config_spectrum(config).labels)}"
             )
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])
 
@@ -1384,8 +1545,12 @@ def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> 
         f"Scenario: {config.mode}, satellite geometry at {simulation.time_utc} "
         f"(TLE: {config.tle.splitlines()[0].strip()})"
     )
-    labels = ", ".join(make_spectrum(config.band_set, config.channel).labels)
+    spectrum = config_spectrum(config)
+    labels = ", ".join(spectrum.labels)
     log(f"Band set: {config.band_set}; channel: {config.channel} ({labels})")
+    if config.band_set == BAND_SET_GRID:
+        log(f"Grid: {len(spectrum.run_wavelength)} wavelengths between {config.grid_range_nm[0]:g} and "
+            f"{config.grid_range_nm[1]:g} nm, photons drawn in proportion to response x solar irradiance")
     renders = config.renders
     if renders > 1 and not config.pointing_noise_enabled:
         log("Pointing error is off, so repeated renders would be identical: doing 1.")

@@ -26,9 +26,10 @@ CONFIG_PATH = "configs/scenario.json"
 # "red" (a single wavelength, written as a grayscale image).
 CHANNEL = None
 
-# What a channel is: "rgb" (single wavelengths: 440, 550 and 670 nm) or "modis"
-# (the MODIS Terra channels b03, b04 and b01, simulated as REPTRAN bands). None
-# uses the scenario file's own "band_set" setting.
+# What a channel is: "rgb" (single wavelengths: 440, 550 and 670 nm), "modis"
+# (the MODIS Terra channels b03, b04 and b01, simulated as REPTRAN bands) or
+# "grid" (a grid of wavelengths over the camera's range, see grid_range_nm in the
+# scenario file). None uses the scenario file's own "band_set" setting.
 BAND_SET = None
 
 # No display on this kind of machine: keep Traits/Pyface on their no-GUI

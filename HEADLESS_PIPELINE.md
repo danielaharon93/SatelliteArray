@@ -109,7 +109,9 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
 | `channel` | Which wavelengths to simulate: `"all"` (default: blue, green and red, 440 / 550 / 670 nm) or one of `"blue"`, `"green"`, `"red"` (a single wavelength: the `.npy` has shape `(height, width, 1)` and the PNG is grayscale). Set it in the GUI with "Color channel", or override it for one headless run with `CHANNEL` in `run_from_config.py`. |
-| `band_set` | What a channel is: `"rgb"` (default: single wavelengths, 440 / 550 / 670 nm) or `"modis"` (the MODIS Terra channels b03 blue 456-474 nm, b04 green 545-565 nm and b01 red 625-667 nm, simulated as SMART-G REPTRAN bands, see [Band sets](#band-sets)). Set it in the GUI with "Band set", or override it for one headless run with `BAND_SET` in `run_from_config.py`. |
+| `band_set` | What a channel is: `"rgb"` (default: single wavelengths, 440 / 550 / 670 nm), `"modis"` (the MODIS Terra channels b03, b04 and b01, simulated as SMART-G REPTRAN bands) or `"grid"` (a grid of wavelengths over a camera's range, with the photons' wavelengths drawn in proportion to response x solar irradiance), see [Band sets](#band-sets). Set it in the GUI with "Band set", or override it for one headless run with `BAND_SET` in `run_from_config.py`. |
+| `grid_range_nm` | `"grid"` only: `[low, high]`, the camera's range in nm (default `[400, 700]`, allowed 300-4000), split into equal thirds for the blue, green and red channels. |
+| `grid_step_nm` | `"grid"` only: width of the wavelength bins in nm (default 10; at most a third of the range). One wavelength is simulated per bin, at its centre. |
 | `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`) or `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)). |
 | `bomex_netcdf` | Path to the BOMEX `…com3D_int_2.nc` file (the one with the `FNCD` droplet spectrum). Required for `"bomex"`. |
 | `extinction_method` | `"q2"` (default: extinction with Q = 2, the paper's approximation) or `"mie"` (the Mie Q of each radius bin). Only used by `"bomex"`. |
@@ -166,6 +168,20 @@ files, which needs no GPU.
   tests the result at those wavelengths simulated one by one agreed with the REPTRAN result to within the
   Monte Carlo noise. The band data (`reptran/reptran_solar_modis.cdf` and its gas tables) must be in the SMART-G
   auxiliary data.
+
+- `"grid"`: a grid of wavelengths over the camera's range (`grid_range_nm`, default 400-700 nm), split into equal thirds
+  for the blue (400-500), green (500-600) and red (600-700 nm) channels, with one wavelength per `grid_step_nm` bin. The
+  camera response is **uniform** for now (`camera_response()` in `playground_core.py` is the place to put a real curve). Each
+  photon gets a random wavelength drawn with SMART-G's `wavelength_proba`, in proportion to response x solar irradiance
+  (from the `extra` values of the REPTRAN solar file) x bin width, and equally between the channels. A channel's
+  reflectance is the weighted mean of its wavelengths with those weights, so each channel is as precise as a single wavelength
+  simulated with all of its photons. Besides the image, the reflectance at every wavelength is saved in
+  `<name>_spectral.npz` (`reflectance` of shape (height, width, n_wavelengths), `wavelength_nm`, `sampling_probability`,
+  `channel_weight`, `channel_of_wavelength`, `channel_labels`), so that another camera response or sun spectrum can be applied
+  later without a new render. A single wavelength is noisy (it got only a small share of the photons); only the weighted sums
+  over a channel are smooth. Memory: SMART-G builds one phase matrix per wavelength and per distinct droplet radius, so
+  this band set rounds the radius to 1 um (the spacing of SMART-G's cloud table) instead of 0.1 um; at 0.1 um a 30-wavelength
+  run needs about 24 GB of host memory.
 
 `channel` picks all three channels or one of them in either band set. The raw-reflectance figure and the printed
 statistics name the bands (for example `MODIS b03 (456-474 nm)`). Only the spectral side of a camera is

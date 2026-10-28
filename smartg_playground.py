@@ -74,6 +74,8 @@ import pointing_noise
 from playground_core import (
     BAND_SETS,
     CHANNELS,
+    GRID_DEFAULT_RANGE_NM,
+    GRID_DEFAULT_STEP_NM,
     CLOUD_SOURCES,
     CONFIG_DIR,
     DEFAULT_HG_G,
@@ -142,6 +144,10 @@ class SmartgPlayground(HasTraits):
     channel = Enum(list(CHANNELS))
     # What a channel is: single wavelengths, or MODIS channels (see BAND_SETS).
     band_set = Enum(list(BAND_SETS))
+    # The "grid" band set: the camera's wavelength range and the grid's bin width.
+    grid_range_low_nm = Range(300.0, 4000.0, GRID_DEFAULT_RANGE_NM[0], mode="text")
+    grid_range_high_nm = Range(300.0, 4000.0, GRID_DEFAULT_RANGE_NM[1], mode="text")
+    grid_step_nm = Range(0.5, 1000.0, GRID_DEFAULT_STEP_NM, mode="text")
 
     cloud_source = Enum(list(CLOUD_SOURCES))
     bomex_netcdf = Str()
@@ -223,7 +229,8 @@ class SmartgPlayground(HasTraits):
                     label="Band set",
                     tooltip=(
                         "rgb: single wavelengths (440, 550, 670 nm); modis: the MODIS Terra "
-                        "channels b03, b04, b01, simulated as REPTRAN bands"
+                        "channels b03, b04, b01, simulated as REPTRAN bands; grid: a grid of "
+                        "wavelengths over the camera's range, sampled by response x solar irradiance"
                     ),
                 ),
                 Item(
@@ -234,6 +241,16 @@ class SmartgPlayground(HasTraits):
                         "which gives a grayscale image"
                     ),
                 ),
+            ),
+            HGroup(
+                Item("grid_range_low_nm", label="Camera range from (nm)"),
+                Item("grid_range_high_nm", label="to (nm)"),
+                Item(
+                    "grid_step_nm",
+                    label="Grid step (nm)",
+                    tooltip="Bin width of the wavelength grid; the range is split into equal thirds for blue, green and red",
+                ),
+                visible_when="band_set == 'grid'",
             ),
             HGroup(
                 Item("periodic", label="Periodic domain"),
@@ -618,6 +635,8 @@ class SmartgPlayground(HasTraits):
             photons_per_pixel=self.photons_per_pixel,
             channel=self.channel,
             band_set=self.band_set,
+            grid_range_nm=[self.grid_range_low_nm, self.grid_range_high_nm],
+            grid_step_nm=self.grid_step_nm,
             cloud_source=self.cloud_source,
             bomex_netcdf=self.bomex_netcdf.strip(),
             extinction_method=self.extinction_method,
@@ -649,6 +668,8 @@ class SmartgPlayground(HasTraits):
         self.photons_per_pixel = config.photons_per_pixel
         self.channel = config.channel
         self.band_set = config.band_set
+        self.grid_range_low_nm, self.grid_range_high_nm = config.grid_range_nm
+        self.grid_step_nm = config.grid_step_nm
         self.cloud_source = config.cloud_source
         self.bomex_netcdf = config.bomex_netcdf
         self.extinction_method = config.extinction_method
