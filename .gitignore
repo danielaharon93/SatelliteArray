@@ -26,3 +26,5 @@ Target_Noise_Model_Document.pdf
 # and the large netCDF datasets themselves
 generated_clouds/
 *.nc
+clear_ocean_runs/
+*.hdf

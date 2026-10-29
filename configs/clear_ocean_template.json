@@ -1,0 +1,22 @@
+{
+  "name": "terra_2023-03-05_1750_south_pacific_gyre",
+  "_note": "TEMPLATE. The geometry below is only approximate (sun from a solar-position formula for 25S 120W; the view angles are placeholders). Replace sun/view angles with the MOD03 values of your pixel, the aerosol with MOD04, and the rest with MOD07 / MERRA-2. Azimuths: degrees clockwise from north, of the direction toward the sun / the sensor. Leave a value out (or null) to use SMART-G's default.",
+  "latitude_deg": -25.0,
+  "sun_zenith_deg": 38.9,
+  "sun_azimuth_deg": 66.8,
+  "view_zenith_deg": 10.0,
+  "view_azimuth_deg": 280.0,
+  "wind_speed_ms": 4.0,
+  "atmosphere_profile": "afglt",
+  "surface_pressure_hpa": 1013.0,
+  "ozone_dobson": 270,
+  "water_vapour_g_cm2": null,
+  "aod_550": 0.06,
+  "aerosol_model": "maritime_clean",
+  "observed_reflectance": {
+    "b03": null,
+    "b04": null,
+    "b01": null
+  },
+  "chlorophyll_mg_m3": null
+}

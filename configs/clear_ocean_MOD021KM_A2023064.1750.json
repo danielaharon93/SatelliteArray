@@ -1,0 +1,69 @@
+{
+  "name": "MOD021KM_A2023064.1750",
+  "_note": "Geometry and observed reflectance extracted from MOD021KM.A2023064.1750.061.2023065012217.hdf (box (-125.0, -28.0, -115.0, -22.0)); aerosol, ozone, water vapour and pressure from the MOD04_L2 / MOD07_L2 files named in the extractor (medians in the box). The wind speed is still the template's: take it from MERRA-2 / ERA5.",
+  "latitude_deg": -25.163,
+  "sun_zenith_deg": 39.23,
+  "sun_azimuth_deg": 66.8,
+  "view_zenith_deg": 12.91,
+  "view_azimuth_deg": 98.85,
+  "wind_speed_ms": 4.0,
+  "atmosphere_profile": "afglt",
+  "surface_pressure_hpa": 1018.9,
+  "ozone_dobson": 263.3,
+  "water_vapour_g_cm2": 3.046,
+  "aod_550": 0.087,
+  "aerosol_model": "maritime_clean",
+  "observed_reflectance": {
+    "b03": 0.12391,
+    "b04": 0.05409,
+    "b01": 0.02919
+  },
+  "_ancillary_spread": {
+    "aod_550": {
+      "cells": 2632,
+      "p10_p90": [
+        0.07100000337231904,
+        0.113000005367212
+      ]
+    },
+    "ozone_dobson": {
+      "cells": 20406,
+      "p10_p90": [
+        256.40000382065773,
+        270.30000402778387
+      ]
+    },
+    "water_vapour_g_cm2": {
+      "cells": 20406,
+      "p10_p90": [
+        2.867000136175193,
+        3.2830001559341326
+      ]
+    },
+    "surface_pressure_hpa": {
+      "cells": 20406,
+      "p10_p90": [
+        1018.0000151693821,
+        1019.600015193224
+      ]
+    }
+  },
+  "_observed_spread": {
+    "b03": {
+      "std": 0.0073,
+      "p10": 0.1161,
+      "p90": 0.13537
+    },
+    "b04": {
+      "std": 0.00384,
+      "p10": 0.05014,
+      "p90": 0.05972
+    },
+    "b01": {
+      "std": 0.00288,
+      "p10": 0.02694,
+      "p90": 0.0333
+    }
+  },
+  "chlorophyll_mg_m3": 0.05
+}

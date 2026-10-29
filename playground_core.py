@@ -71,6 +71,23 @@ SURFACES = (SURFACE_LAMBERTIAN, SURFACE_OCEAN)
 DEFAULT_WIND_SPEED_MS = 5.0
 MAX_WIND_SPEED_MS = 30.0
 
+# The aerosol of the atmosphere: none (the original behaviour) or one of SMART-G's
+# OPAC mixtures, with its optical depth at 550 nm - see Environment.
+AEROSOL_NONE = "none"
+AEROSOL_MODELS = (AEROSOL_NONE, "maritime_clean", "maritime_polluted", "maritime_tropical", "continental_clean",
+                  "continental_average", "continental_polluted", "urban", "desert")
+DEFAULT_AOD_550 = 0.1
+# With an aerosol every optical cell of the 3D atmosphere gets its own phase function (the
+# cloud, the aerosol and the molecules are mixed in different proportions in each), tens
+# of thousands of them, and SMART-G stores each at n_icdf angles (default 1e6: 28 MB per
+# phase function). The phase matrices themselves carry 721 angles (0.25 deg), so that many
+# are used for the table instead; without an aerosol the default is kept.
+AEROSOL_N_ICDF = 721
+MAX_AOD_550 = 3.0
+AEROSOL_RH_PERCENT = 80.0  # relative humidity of the aerosol's mixing layer
+DEFAULT_CHLOROPHYLL_MG_M3 = 0.05
+MAX_CHLOROPHYLL_MG_M3 = 10.0
+
 DEFAULT_NOISE_PARAMS = pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
 
 # The 3D cloud: SMART-G's bundled cumulus.dat (the original behaviour), or a
@@ -348,6 +365,70 @@ def build_surface(
 
 
 @dataclass(frozen=True)
+class Environment:
+    """What surrounds the cloud: the aerosol and the gas amounts of the
+    atmosphere, and whether light enters the sea. The defaults (no aerosol,
+    the AFGL profile's own gas amounts, a reflecting-only sea) are what the
+    playground simulated before these settings existed.
+
+    `aerosol_model` is an OPAC mixture (AEROSOL_MODELS) with optical depth
+    `aod_550` at 550 nm, or "none". `ozone_dobson`, `water_vapour_g_cm2` and
+    `surface_pressure_hpa` rescale the AFGL profile when not None.
+    `water_body` (ocean surface only) lets light through the air-water interface into
+    a water column of pure water and chlorophyll-bearing particles
+    (`chlorophyll_mg_m3`), so the sea has its water-leaving light (its colour)."""
+
+    aerosol_model: str = AEROSOL_NONE
+    aod_550: float = DEFAULT_AOD_550
+    ozone_dobson: float | None = None
+    water_vapour_g_cm2: float | None = None
+    surface_pressure_hpa: float | None = None
+    water_body: bool = False
+    chlorophyll_mg_m3: float = DEFAULT_CHLOROPHYLL_MG_M3
+    atmosphere_profile: str | None = None  # an AFGL profile name; None: main.SMARTG_AFGL_PROFILE
+
+
+def build_atmosphere_1d(lat_deg: float, environment: Environment | None = None):
+    """The molecular atmosphere (AFGL profile at `lat_deg`, rescaled by the
+    environment's gas amounts) with its aerosol, as an Atm1D."""
+    from smartg.atmosphere import AerOPAC, Atm1D
+
+    environment = environment or Environment()
+    aerosols = []
+    if environment.aerosol_model != AEROSOL_NONE and environment.aod_550 > 0.0:
+        aerosols.append(AerOPAC(environment.aerosol_model, environment.aod_550, 550.0, rh_mix=AEROSOL_RH_PERCENT))
+    return Atm1D(
+        environment.atmosphere_profile or main.SMARTG_AFGL_PROFILE,
+        comp=aerosols or None,
+        lat=lat_deg,
+        p0=environment.surface_pressure_hpa,
+        tco3=environment.ozone_dobson,
+        tcwp=environment.water_vapour_g_cm2,
+    )
+
+
+def smartg_run_options(environment: Environment | None = None) -> dict:
+    """Extra keyword arguments for Smartg.run() that the environment needs."""
+    if environment is not None and environment.aerosol_model != AEROSOL_NONE and environment.aod_550 > 0.0:
+        return {"n_icdf": AEROSOL_N_ICDF}
+    return {}
+
+
+def build_ocean(surface: str, wind_speed_ms: float, environment: Environment | None = None):
+    """(surface, water) to pass to SMART-G. For SURFACE_OCEAN with the environment's
+    `water_body`: a rough sea that also transmits (sur=3) over a Water1D column,
+    so the water-leaving light is simulated; otherwise build_surface() and no water."""
+    environment = environment or Environment()
+    if surface == SURFACE_OCEAN and environment.water_body:
+        from smartg.surface import RoughSurface
+        from smartg.water import HydrosolPR, Water1D
+
+        sea = RoughSurface(wind=wind_speed_ms, sur=3, wave_shadow=True)
+        return sea, Water1D(comp=[HydrosolPR(chl=environment.chlorophyll_mg_m3)])
+    return build_surface(surface, wind_speed_ms), None
+
+
+@dataclass(frozen=True)
 class CloudSource:
     """The 3D cloud a render uses: a cumulus.dat-format file, and the droplet
     phase function ("mie": SMART-G's water-cloud table, or "hg":
@@ -435,6 +516,7 @@ def build_scene_3d(
     wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
     cloud: CloudSource | None = None,
     spectrum: Spectrum | None = None,
+    environment: Environment | None = None,
 ):
     """Like main.build_smartg_scene_3d(), except the domain's horizontal
     boundary condition (periodic vs. non-periodic + extended margin) is a
@@ -445,10 +527,15 @@ def build_scene_3d(
     water-cloud-table phase function) is a parameter too, and so is the
     `spectrum` (see Spectrum; default: the three RGB wavelengths).
 
-    Returns (wavelength, atmosphere, surface, grid_3d), as
-    main.build_smartg_scene_3d() does; `wavelength` is `spectrum.run_wavelength`:
-    the array of wavelengths, or the REPTRAN bands, to pass to SMART-G."""
-    from smartg.atmosphere import Atm1D, Atm3D, Cloud3D, read_i3rc_cloud
+    `environment` (see Environment) adds the aerosol, rescales the gas amounts and
+    can add the water body of the sea.
+
+    Returns (wavelength, atmosphere, surface, grid_3d, water): the first four as
+    main.build_smartg_scene_3d() does, and the water column to pass to SMART-G's
+    `water` (None unless the environment asks for a water body); `wavelength` is
+    `spectrum.run_wavelength`: the array of wavelengths, or the REPTRAN bands, to
+    pass to SMART-G."""
+    from smartg.atmosphere import Atm3D, Cloud3D, read_i3rc_cloud
     from smartg.grid3d import Grid3D
 
     cloud = cloud or bundled_cloud()
@@ -482,10 +569,15 @@ def build_scene_3d(
         field["z_bounds"].values,
         **grid_kwargs,
     )
-    atm_1d = Atm1D(main.SMARTG_AFGL_PROFILE, lat=lat_deg)
+    if environment is not None and environment.water_body:
+        raise NotImplementedError(
+            "The water body of the sea is not supported in the 3D render: SMART-G's 3D mode failed with it "
+            "(KeyError 'iabs_oc'). Use run_clear_ocean.py for a cloud-free scene with the water body."
+        )
+    atm_1d = build_atmosphere_1d(lat_deg, environment)
     atmosphere = Atm3D(atm_1d=atm_1d, grid_3d=grid_3d, comp_3d=[cloud_3d])
-    surface = build_surface(surface, wind_speed_ms)
-    return spectrum.run_wavelength, atmosphere, surface, grid_3d
+    surface, water = build_ocean(surface, wind_speed_ms, environment)
+    return spectrum.run_wavelength, atmosphere, surface, grid_3d, water
 
 
 def footprint_sensors(
@@ -577,6 +669,7 @@ def render_view(
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
     spectral_out: dict | None = None,
+    environment: Environment | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """Run one SMART-G 3D radiative-transfer view of the cloud field,
     centred on point_a_km, as seen from satellite_position_km, under a
@@ -615,8 +708,8 @@ def render_view(
 
     lat_deg = main.geocentric_latitude_deg(point_a_km)
     spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
-    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
-        lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum
+    wavelength_nm, atmosphere, surface, grid_3d, water = build_scene_3d(
+        lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum, environment
     )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
@@ -650,10 +743,12 @@ def render_view(
         wavelength_proba=spectrum.wavelength_proba,
         atmosphere=atmosphere_profile,
         surface=surface,
+        water=water,
         sensor=sensors,
         le=le,
         n_photons=n_photons,
         progress=False,
+        **smartg_run_options(environment),
     )
     toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
     reflectance = spectrum.channels(toa_reflectance.values).reshape(height_px, width_px, spectrum.n_channels)
@@ -681,6 +776,7 @@ def render_formation_frozen(
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
     spectral_out: dict | None = None,
+    environment: Environment | None = None,
 ) -> dict[int, np.ndarray]:
     """Render the CloudCT formation's frozen-in-time geometry, exactly as
     main.py defines it (main.formation_positions_km(): satellite index
@@ -720,8 +816,8 @@ def render_formation_frozen(
 
     lat_deg = main.geocentric_latitude_deg(target_km)
     spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
-    wavelength_nm, atmosphere, surface, grid_3d = build_scene_3d(
-        lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum
+    wavelength_nm, atmosphere, surface, grid_3d, water = build_scene_3d(
+        lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum, environment
     )
     atmosphere_profile = atmosphere.calc(wavelength_nm)
 
@@ -760,10 +856,12 @@ def render_formation_frozen(
             wavelength_proba=spectrum.wavelength_proba,
             atmosphere=atmosphere_profile,
             surface=surface,
+            water=water,
             sensor=sensors,
             le=le,
             n_photons=n_photons,
             progress=False,
+            **smartg_run_options(environment),
         )
         toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
         images[index] = spectrum.channels(toa_reflectance.values).reshape(
@@ -821,6 +919,18 @@ class PlaygroundConfig:
     grid_range_nm: list[float] = field(default_factory=lambda: list(GRID_DEFAULT_RANGE_NM))
     grid_step_nm: float = GRID_DEFAULT_STEP_NM
 
+    # The atmosphere and the sea beyond the cloud (see Environment): an OPAC aerosol
+    # with optical depth `aod_550` ("none" = no aerosol), optional ozone (Dobson units),
+    # water vapour (g/cm2) and surface pressure (hPa) that rescale the AFGL profile
+    # (None = the profile's own). The sea's water body (Environment.water_body) is
+    # not offered here: SMART-G's 3D mode failed with it (see build_scene_3d()); it
+    # works in the cloud-free run_clear_ocean.py.
+    aerosol_model: str = AEROSOL_NONE
+    aod_550: float = DEFAULT_AOD_550
+    ozone_dobson: float | None = None
+    water_vapour_g_cm2: float | None = None
+    surface_pressure_hpa: float | None = None
+
     cloud_source: str = CLOUD_BUNDLED
     bomex_netcdf: str = ""
     extinction_method: str = cloud_microphysics.EXTINCTION_Q2
@@ -844,6 +954,15 @@ class PlaygroundConfig:
     # draws fresh pointing errors, so it only means something with the
     # noise enabled.
     renders: int = 1
+
+    def environment(self) -> Environment:
+        return Environment(
+            aerosol_model=self.aerosol_model,
+            aod_550=self.aod_550,
+            ozone_dobson=self.ozone_dobson,
+            water_vapour_g_cm2=self.water_vapour_g_cm2,
+            surface_pressure_hpa=self.surface_pressure_hpa,
+        )
 
     def noise_params(self) -> pointing_noise.PointingNoiseParams:
         return pointing_noise.PointingNoiseParams(
@@ -870,6 +989,14 @@ class PlaygroundConfig:
             raise ValueError(f"surface must be one of {SURFACES}, not {self.surface!r}")
         if not 0.0 <= self.wind_speed_ms <= MAX_WIND_SPEED_MS:
             raise ValueError(f"wind_speed_ms must be in [0, {MAX_WIND_SPEED_MS}]")
+        if self.aerosol_model not in AEROSOL_MODELS:
+            raise ValueError(f"aerosol_model must be one of {AEROSOL_MODELS}, not {self.aerosol_model!r}")
+        if not 0.0 <= self.aod_550 <= MAX_AOD_550:
+            raise ValueError(f"aod_550 must be in [0, {MAX_AOD_550}]")
+        for name, low, high in (("ozone_dobson", 100.0, 600.0), ("water_vapour_g_cm2", 0.01, 10.0), ("surface_pressure_hpa", 500.0, 1100.0)):
+            value = getattr(self, name)
+            if value is not None and not low <= value <= high:
+                raise ValueError(f"{name} must be in [{low:g}, {high:g}] or null")
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
             raise ValueError(f"off_nadir_deg must be in [0, {MAX_OFF_NADIR_DEG}]")
         if not all(0 <= i < main.NUM_SATELLITES for i in self.satellites_to_render):
@@ -1140,9 +1267,16 @@ class PlaygroundSimulation:
         return true_point_km, rotation_rad, summary
 
     def _surface_file_suffix(self, config: PlaygroundConfig) -> str:
+        """Names the sea (_ocean5ms) and the atmosphere's aerosol and gas amounts; empty
+        for the original settings."""
+        suffix = ""
         if config.surface == SURFACE_OCEAN:
-            return f"_ocean{config.wind_speed_ms:g}ms"
-        return ""
+            suffix += f"_ocean{config.wind_speed_ms:g}ms"
+        if config.aerosol_model != AEROSOL_NONE:
+            suffix += f"_{config.aerosol_model}{config.aod_550:g}"
+        if any(v is not None for v in (config.ozone_dobson, config.water_vapour_g_cm2, config.surface_pressure_hpa)):
+            suffix += "_gas"
+        return suffix
 
     def _cloud_file_suffix(self, config: PlaygroundConfig) -> str:
         """Tells apart the images of different clouds and phase functions; empty
@@ -1229,6 +1363,7 @@ class PlaygroundSimulation:
             grid_range_nm=tuple(config.grid_range_nm),
             grid_step_nm=config.grid_step_nm,
             spectral_out=spectral,
+            environment=config.environment(),
         )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
@@ -1299,6 +1434,7 @@ class PlaygroundSimulation:
             grid_range_nm=tuple(config.grid_range_nm),
             grid_step_nm=config.grid_step_nm,
             spectral_out=spectral,
+            environment=config.environment(),
         )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"

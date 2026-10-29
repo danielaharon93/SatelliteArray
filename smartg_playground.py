@@ -66,23 +66,26 @@ import numpy as np
 from mayavi.core.ui.api import MayaviScene, MlabSceneModel, SceneEditor
 from pyface.api import GUI, OK, FileDialog
 from skyfield.api import load
-from traits.api import Bool, Button, Enum, HasTraits, Instance, Int, List, Range, Str, observe
+from traits.api import Bool, Button, Enum, Float, HasTraits, Instance, Int, List, Range, Str, observe
 from traitsui.api import CheckListEditor, HGroup, Item, VGroup, View
 
 import main
 import pointing_noise
 from playground_core import (
+    AEROSOL_MODELS,
     BAND_SETS,
     CHANNELS,
     GRID_DEFAULT_RANGE_NM,
     GRID_DEFAULT_STEP_NM,
     CLOUD_SOURCES,
     CONFIG_DIR,
+    DEFAULT_AOD_550,
     DEFAULT_HG_G,
     DEFAULT_NOISE_PARAMS,
     DEFAULT_WIND_SPEED_MS,
     EXTINCTION_METHODS,
     FORMATION_MODE,
+    MAX_AOD_550,
     MAX_OFF_NADIR_DEG,
     MAX_WIND_SPEED_MS,
     PHASE_FUNCTIONS,
@@ -156,6 +159,14 @@ class SmartgPlayground(HasTraits):
     bomex_crop_cells = Range(0, 4096, 0, mode="text")
     phase_function = Enum(list(PHASE_FUNCTIONS))
     hg_g = Range(-0.99, 0.99, DEFAULT_HG_G, mode="text")
+
+    # The atmosphere beyond the cloud (see playground_core.Environment).
+    # For the three gas amounts 0 means "the AFGL profile's own value".
+    aerosol_model = Enum(list(AEROSOL_MODELS))
+    aod_550 = Range(0.0, MAX_AOD_550, DEFAULT_AOD_550, mode="text")
+    ozone_dobson = Float(0.0)
+    water_vapour_g_cm2 = Float(0.0)
+    surface_pressure_hpa = Float(0.0)
 
     # Pointing error (see pointing_noise.py). Sigmas are 1 sigma per
     # cross-boresight axis; picking a preset fills them in, editing any of
@@ -305,6 +316,38 @@ class SmartgPlayground(HasTraits):
                     visible_when="cloud_source == 'bomex'",
                 ),
                 label="Cloud",
+                show_border=True,
+            ),
+            VGroup(
+                HGroup(
+                    Item(
+                        "aerosol_model",
+                        label="Aerosol",
+                        tooltip="An OPAC aerosol mixture, or none (the atmosphere is then molecules only)",
+                    ),
+                    Item(
+                        "aod_550",
+                        label="Optical depth (550 nm)",
+                        enabled_when="aerosol_model != 'none'",
+                        tooltip="Aerosol optical depth at 550 nm; about 0.05-0.15 over the clean ocean",
+                    ),
+                    Item(
+                        "ozone_dobson",
+                        label="Ozone (DU)",
+                        tooltip="Total ozone column in Dobson units; 0 keeps the AFGL profile's own (about 300)",
+                    ),
+                    Item(
+                        "water_vapour_g_cm2",
+                        label="Water vapour (g/cm2)",
+                        tooltip="Precipitable water vapour; 0 keeps the AFGL profile's own",
+                    ),
+                    Item(
+                        "surface_pressure_hpa",
+                        label="Pressure (hPa)",
+                        tooltip="Surface pressure; 0 keeps the AFGL profile's own",
+                    ),
+                ),
+                label="Atmosphere",
                 show_border=True,
             ),
             VGroup(
@@ -643,6 +686,11 @@ class SmartgPlayground(HasTraits):
             bomex_crop_cells=self.bomex_crop_cells,
             phase_function=self.phase_function,
             hg_g=self.hg_g,
+            aerosol_model=self.aerosol_model,
+            aod_550=self.aod_550,
+            ozone_dobson=self.ozone_dobson or None,
+            water_vapour_g_cm2=self.water_vapour_g_cm2 or None,
+            surface_pressure_hpa=self.surface_pressure_hpa or None,
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
             acquisition_interval_s=self.acquisition_interval_s,
@@ -676,6 +724,11 @@ class SmartgPlayground(HasTraits):
         self.bomex_crop_cells = config.bomex_crop_cells
         self.phase_function = config.phase_function
         self.hg_g = config.hg_g
+        self.aerosol_model = config.aerosol_model
+        self.aod_550 = config.aod_550
+        self.ozone_dobson = config.ozone_dobson or 0.0
+        self.water_vapour_g_cm2 = config.water_vapour_g_cm2 or 0.0
+        self.surface_pressure_hpa = config.surface_pressure_hpa or 0.0
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor
         self.acquisition_interval_s = config.acquisition_interval_s
