@@ -95,9 +95,13 @@ DEFAULT_NOISE_PARAMS = pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
 # and cumulus_file.py). The BOMEX cloud is written once to a cumulus.dat-format
 # file in GENERATED_CLOUD_DIR and reused while the dataset and the settings
 # that shape it (extinction method, crop) stay the same.
+# "none" is no cloud at all: the clear-sky scene of an atmosphere over the sea or the
+# ground, which SMART-G computes in 1D (see render_clear_sky()); only there can the sea
+# have its water body.
 CLOUD_BUNDLED = "bundled"
 CLOUD_BOMEX = "bomex"
-CLOUD_SOURCES = (CLOUD_BUNDLED, CLOUD_BOMEX)
+CLOUD_NONE = "none"
+CLOUD_SOURCES = (CLOUD_BUNDLED, CLOUD_BOMEX, CLOUD_NONE)
 GENERATED_CLOUD_DIR = Path(__file__).with_name("generated_clouds")
 GENERATED_CLOUD_VERSION = 1  # bump when the generated file's content changes
 EXTINCTION_METHODS = (cloud_microphysics.EXTINCTION_Q2, cloud_microphysics.EXTINCTION_MIE)
@@ -499,8 +503,11 @@ def bomex_cloud_file(
 
 def resolve_cloud(
     config: "PlaygroundConfig", on_status: Callable[[str], None] | None = None
-) -> CloudSource:
-    """The cloud a config asks for (building the BOMEX cloud file if needed)."""
+) -> CloudSource | None:
+    """The cloud a config asks for (building the BOMEX cloud file if needed); None
+    for the clear sky."""
+    if config.cloud_source == CLOUD_NONE:
+        return None
     if config.cloud_source == CLOUD_BUNDLED:
         return bundled_cloud(config.phase_function, config.hg_g)
     dat_path = bomex_cloud_file(
@@ -757,6 +764,76 @@ def render_view(
     return reflectance, vza_deg, vaa_deg
 
 
+def render_clear_sky(
+    views_km: list[tuple[np.ndarray, np.ndarray]],
+    sza_deg: float,
+    saa_deg: float,
+    width_px: int,
+    height_px: int,
+    n_photons: float | None = None,
+    surface: str = SURFACE_LAMBERTIAN,
+    wind_speed_ms: float = DEFAULT_WIND_SPEED_MS,
+    channel: str = CHANNEL_ALL,
+    band_set: str = BAND_SET_RGB,
+    grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
+    grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    spectral_out: dict | None = None,
+    environment: Environment | None = None,
+) -> list[tuple[np.ndarray, float, float]]:
+    """The clear-sky scene: the atmosphere (molecules and, with the environment,
+    aerosol) over the surface, no cloud. SMART-G computes it as a plane-parallel 1D
+    scene, which can hold what its 3D mode cannot: the sea with its water body
+    (`environment.water_body`, see build_ocean()).
+
+    `views_km` lists the views as (satellite position, ground point) pairs, in km;
+    one SMART-G run gives all of them, each as a local estimate in its own viewing
+    direction. The scene is the same everywhere, so every image is uniform: the
+    reflectance of the view, repeated over the (height_px, width_px) pixels. Returns,
+    per view, (that image, VZA, VAA) - the ground viewing angles, as in render_view().
+    `n_photons` (default: per-pixel photons x pixels) is the total of the one run.
+
+    If `spectral_out` is a dict, the reflectance at every simulated wavelength of
+    view i is stored in it under i, as an array of shape (1, 1, n_wavelengths)."""
+    main.ensure_cuda_compatible_msvc_on_path()
+    from smartg.smartg import LocalEstimate, Smartg
+
+    if n_photons is None:
+        n_photons = main.SMARTG_3D_PHOTONS_PER_PIXEL * width_px * height_px
+    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
+    angles = [main.viewing_angles_deg(position_km, ground_km) for position_km, ground_km in views_km]
+    lat_deg = main.geocentric_latitude_deg(views_km[0][1])
+    sea, water = build_ocean(surface, wind_speed_ms, environment)
+
+    # The sun direction goes to the run, the viewing directions to the local estimate;
+    # both in the frame of viewing_angles_deg(), where the sun glint is at the sun's
+    # azimuth + 180 deg.
+    ds = Smartg().run(
+        wavelength=spectrum.run_wavelength,
+        wavelength_proba=spectrum.wavelength_proba,
+        atmosphere=build_atmosphere_1d(lat_deg, environment),
+        surface=sea,
+        water=water,
+        th_deg=sza_deg,
+        ph_deg=saa_deg,
+        le=LocalEstimate(
+            th_deg=np.array([vza for vza, _ in angles]),
+            phi_deg=np.array([vaa for _, vaa in angles]),
+            zip=True,
+        ),
+        n_photons=n_photons,
+        progress=False,
+    )
+    toa = ds["I_up (TOA)"].transpose("Zenith angles", "wavelength").values  # (views, wavelengths)
+    channels = spectrum.channels(toa)
+    results = []
+    for index, (vza_deg, vaa_deg) in enumerate(angles):
+        image = np.broadcast_to(channels[index], (height_px, width_px, spectrum.n_channels)).copy()
+        results.append((image, vza_deg, vaa_deg))
+        if spectral_out is not None:
+            spectral_out[index] = toa[index].reshape(1, 1, -1)
+    return results
+
+
 def render_formation_frozen(
     target_km: np.ndarray,
     positions_km: np.ndarray,
@@ -922,14 +999,16 @@ class PlaygroundConfig:
     # The atmosphere and the sea beyond the cloud (see Environment): an OPAC aerosol
     # with optical depth `aod_550` ("none" = no aerosol), optional ozone (Dobson units),
     # water vapour (g/cm2) and surface pressure (hPa) that rescale the AFGL profile
-    # (None = the profile's own). The sea's water body (Environment.water_body) is
-    # not offered here: SMART-G's 3D mode failed with it (see build_scene_3d()); it
-    # works in the cloud-free run_clear_ocean.py.
+    # (None = the profile's own).
     aerosol_model: str = AEROSOL_NONE
     aod_550: float = DEFAULT_AOD_550
     ozone_dobson: float | None = None
     water_vapour_g_cm2: float | None = None
     surface_pressure_hpa: float | None = None
+    # The sea's water body (Environment.water_body, `chlorophyll_mg_m3`): only with the
+    # ocean surface and no cloud (cloud_source "none"), see validate().
+    water_body: bool = False
+    chlorophyll_mg_m3: float = DEFAULT_CHLOROPHYLL_MG_M3
 
     cloud_source: str = CLOUD_BUNDLED
     bomex_netcdf: str = ""
@@ -962,6 +1041,8 @@ class PlaygroundConfig:
             ozone_dobson=self.ozone_dobson,
             water_vapour_g_cm2=self.water_vapour_g_cm2,
             surface_pressure_hpa=self.surface_pressure_hpa,
+            water_body=self.water_body,
+            chlorophyll_mg_m3=self.chlorophyll_mg_m3,
         )
 
     def noise_params(self) -> pointing_noise.PointingNoiseParams:
@@ -997,6 +1078,13 @@ class PlaygroundConfig:
             value = getattr(self, name)
             if value is not None and not low <= value <= high:
                 raise ValueError(f"{name} must be in [{low:g}, {high:g}] or null")
+        if not 0.0 < self.chlorophyll_mg_m3 <= MAX_CHLOROPHYLL_MG_M3:
+            raise ValueError(f"chlorophyll_mg_m3 must be in (0, {MAX_CHLOROPHYLL_MG_M3:g}]")
+        if self.water_body and (self.surface != SURFACE_OCEAN or self.cloud_source != CLOUD_NONE):
+            raise ValueError(
+                "water_body needs the ocean surface and no cloud (cloud_source 'none'): "
+                "SMART-G's 3D mode cannot hold the water body of the sea"
+            )
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
             raise ValueError(f"off_nadir_deg must be in [0, {MAX_OFF_NADIR_DEG}]")
         if not all(0 <= i < main.NUM_SATELLITES for i in self.satellites_to_render):
@@ -1171,6 +1259,8 @@ class PlaygroundSimulation:
         if unknown:
             raise ValueError(f"unknown resolution(s) {unknown}; choose from {list(RESOLUTION_PRESETS)}")
         cloud = resolve_cloud(config, on_status)
+        if cloud is None:
+            raise ValueError("there is no cloud (clear sky): no voxels to count")
         field = read_i3rc_cloud(cloud.dat_path)
         cloudy = field["ext"].values > 0
         height_km = cloud.center_height_km
@@ -1272,6 +1362,8 @@ class PlaygroundSimulation:
         suffix = ""
         if config.surface == SURFACE_OCEAN:
             suffix += f"_ocean{config.wind_speed_ms:g}ms"
+            if config.water_body:
+                suffix += f"_chl{config.chlorophyll_mg_m3:g}"
         if config.aerosol_model != AEROSOL_NONE:
             suffix += f"_{config.aerosol_model}{config.aod_550:g}"
         if any(v is not None for v in (config.ozone_dobson, config.water_vapour_g_cm2, config.surface_pressure_hpa)):
@@ -1279,8 +1371,11 @@ class PlaygroundSimulation:
         return suffix
 
     def _cloud_file_suffix(self, config: PlaygroundConfig) -> str:
-        """Tells apart the images of different clouds and phase functions; empty
-        for the original settings (bundled cloud, water-cloud-table phase)."""
+        """Tells apart the images of different clouds and phase functions (_clearsky
+        for no cloud); empty for the original settings (bundled cloud,
+        water-cloud-table phase)."""
+        if config.cloud_source == CLOUD_NONE:
+            return "_clearsky"
         suffix = ""
         if config.cloud_source == CLOUD_BOMEX:
             crop = f"_crop{config.bomex_crop_cells}" if config.bomex_crop_cells else ""
@@ -1293,7 +1388,8 @@ class PlaygroundSimulation:
         """For the "grid" band set, save the reflectance at every simulated
         wavelength next to the image (<name>_spectral.npz), so that another
         camera response or sun spectrum can be applied later without a new
-        render. The arrays: `reflectance` (height, width, n_wavelengths),
+        render. The arrays: `reflectance` (height, width, n_wavelengths; (1, 1,
+        n_wavelengths) for the clear sky, whose image is uniform),
         `wavelength_nm`, `sampling_probability` (the share of the photons each
         wavelength got), `channel_weight` and `channel_of_wavelength` (how the
         channels were combined) and `channel_labels`. A wavelength that got few
@@ -1344,27 +1440,46 @@ class PlaygroundSimulation:
             pointing_summary += "  |  "
 
         spectral: dict = {}
-        reflectance, vza_deg, vaa_deg = render_view(
-            self.position_km,
-            point_a_km,
-            config.sza_deg,
-            config.saa_deg,
-            config.periodic,
-            width_px,
-            height_px,
-            n_photons=config.photons_per_pixel * width_px * height_px,
-            true_point_km=true_point_km,
-            footprint_rotation_rad=rotation_rad,
-            surface=config.surface,
-            wind_speed_ms=config.wind_speed_ms,
-            cloud=cloud,
-            channel=config.channel,
-            band_set=config.band_set,
-            grid_range_nm=tuple(config.grid_range_nm),
-            grid_step_nm=config.grid_step_nm,
-            spectral_out=spectral,
-            environment=config.environment(),
-        )
+        if cloud is None:
+            [(reflectance, vza_deg, vaa_deg)] = render_clear_sky(
+                [(self.position_km, true_point_km)],
+                config.sza_deg,
+                config.saa_deg,
+                width_px,
+                height_px,
+                n_photons=config.photons_per_pixel * width_px * height_px,
+                surface=config.surface,
+                wind_speed_ms=config.wind_speed_ms,
+                channel=config.channel,
+                band_set=config.band_set,
+                grid_range_nm=tuple(config.grid_range_nm),
+                grid_step_nm=config.grid_step_nm,
+                spectral_out=spectral,
+                environment=config.environment(),
+            )
+            spectral["single"] = spectral.get(0)
+        else:
+            reflectance, vza_deg, vaa_deg = render_view(
+                self.position_km,
+                point_a_km,
+                config.sza_deg,
+                config.saa_deg,
+                config.periodic,
+                width_px,
+                height_px,
+                n_photons=config.photons_per_pixel * width_px * height_px,
+                true_point_km=true_point_km,
+                footprint_rotation_rad=rotation_rad,
+                surface=config.surface,
+                wind_speed_ms=config.wind_speed_ms,
+                cloud=cloud,
+                channel=config.channel,
+                band_set=config.band_set,
+                grid_range_nm=tuple(config.grid_range_nm),
+                grid_step_nm=config.grid_step_nm,
+                spectral_out=spectral,
+                environment=config.environment(),
+            )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
             f"single_offnadir{config.off_nadir_deg:.0f}_az{config.view_azimuth_deg:.0f}_"
@@ -1415,27 +1530,51 @@ class PlaygroundSimulation:
                 summaries.append(f"Sat {index}: {summary}")
 
         spectral: dict = {}
-        images = render_formation_frozen(
-            self.formation_target_km,
-            self.formation_positions_km,
-            satellite_indices,
-            config.sza_deg,
-            config.saa_deg,
-            config.periodic,
-            width_px,
-            height_px,
-            n_photons=config.photons_per_pixel * width_px * height_px,
-            pointing=pointing,
-            surface=config.surface,
-            wind_speed_ms=config.wind_speed_ms,
-            cloud=cloud,
-            channel=config.channel,
-            band_set=config.band_set,
-            grid_range_nm=tuple(config.grid_range_nm),
-            grid_step_nm=config.grid_step_nm,
-            spectral_out=spectral,
-            environment=config.environment(),
-        )
+        if cloud is None:
+            views = [
+                (self.formation_positions_km[index], pointing.get(index, (self.formation_target_km, 0.0))[0])
+                for index in satellite_indices
+            ]
+            clear = render_clear_sky(
+                views,
+                config.sza_deg,
+                config.saa_deg,
+                width_px,
+                height_px,
+                n_photons=config.photons_per_pixel * width_px * height_px,
+                surface=config.surface,
+                wind_speed_ms=config.wind_speed_ms,
+                channel=config.channel,
+                band_set=config.band_set,
+                grid_range_nm=tuple(config.grid_range_nm),
+                grid_step_nm=config.grid_step_nm,
+                spectral_out=spectral,
+                environment=config.environment(),
+            )
+            images = {index: image for index, (image, _, _) in zip(satellite_indices, clear)}
+            spectral = {index: spectral[position] for position, index in enumerate(satellite_indices)}
+        else:
+            images = render_formation_frozen(
+                self.formation_target_km,
+                self.formation_positions_km,
+                satellite_indices,
+                config.sza_deg,
+                config.saa_deg,
+                config.periodic,
+                width_px,
+                height_px,
+                n_photons=config.photons_per_pixel * width_px * height_px,
+                pointing=pointing,
+                surface=config.surface,
+                wind_speed_ms=config.wind_speed_ms,
+                cloud=cloud,
+                channel=config.channel,
+                band_set=config.band_set,
+                grid_range_nm=tuple(config.grid_range_nm),
+                grid_step_nm=config.grid_step_nm,
+                spectral_out=spectral,
+                environment=config.environment(),
+            )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"
             f"{'periodic' if config.periodic else 'nonperiodic'}"

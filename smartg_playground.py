@@ -80,12 +80,14 @@ from playground_core import (
     CLOUD_SOURCES,
     CONFIG_DIR,
     DEFAULT_AOD_550,
+    DEFAULT_CHLOROPHYLL_MG_M3,
     DEFAULT_HG_G,
     DEFAULT_NOISE_PARAMS,
     DEFAULT_WIND_SPEED_MS,
     EXTINCTION_METHODS,
     FORMATION_MODE,
     MAX_AOD_550,
+    MAX_CHLOROPHYLL_MG_M3,
     MAX_OFF_NADIR_DEG,
     MAX_WIND_SPEED_MS,
     PHASE_FUNCTIONS,
@@ -152,7 +154,11 @@ class SmartgPlayground(HasTraits):
     grid_range_high_nm = Range(300.0, 4000.0, GRID_DEFAULT_RANGE_NM[1], mode="text")
     grid_step_nm = Range(0.5, 1000.0, GRID_DEFAULT_STEP_NM, mode="text")
 
+    # "none" is the clear sky: only the atmosphere and the sea or ground, one uniform
+    # image per view; there the sea can have its water body (chlorophyll).
     cloud_source = Enum(list(CLOUD_SOURCES))
+    water_body = Bool(False)
+    chlorophyll_mg_m3 = Range(0.001, MAX_CHLOROPHYLL_MG_M3, DEFAULT_CHLOROPHYLL_MG_M3, mode="text")
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
     extinction_method = Enum(list(EXTINCTION_METHODS))
@@ -264,7 +270,7 @@ class SmartgPlayground(HasTraits):
                 visible_when="band_set == 'grid'",
             ),
             HGroup(
-                Item("periodic", label="Periodic domain"),
+                Item("periodic", label="Periodic domain", enabled_when="cloud_source != 'none'"),
                 Item("resolution", label="Image resolution"),
                 Item("photons_per_pixel", label="Photons per pixel"),
                 Item("display_gain", label="Display gain"),
@@ -283,19 +289,42 @@ class SmartgPlayground(HasTraits):
                     Item(
                         "cloud_source",
                         label="Cloud",
-                        tooltip="bundled: SMART-G's cumulus.dat; bomex: built from a BOMEX droplet-spectrum netCDF file",
+                        tooltip=(
+                            "bundled: SMART-G's cumulus.dat; bomex: built from a BOMEX droplet-spectrum "
+                            "netCDF file; none: no cloud, only the atmosphere over the sea or ground "
+                            "(a uniform image per view, with the sea's water body as an option)"
+                        ),
                     ),
                     Item(
                         "phase_function",
                         label="Phase function",
                         tooltip="mie: the water-cloud table of SMART-G; hg: Henyey-Greenstein with the asymmetry parameter g",
+                        enabled_when="cloud_source != 'none'",
                     ),
                     Item(
                         "hg_g",
                         label="g",
                         tooltip="Asymmetry parameter of the Henyey-Greenstein phase function (about 0.85 for water clouds)",
-                        enabled_when="phase_function == 'hg'",
+                        enabled_when="phase_function == 'hg' and cloud_source != 'none'",
                     ),
+                ),
+                HGroup(
+                    Item(
+                        "water_body",
+                        label="Sea water body",
+                        tooltip=(
+                            "Light enters the sea and comes back out (water-leaving light: the blue-green "
+                            "colour of the sea). Needs the ocean surface; costs much more run time"
+                        ),
+                        enabled_when="surface == 'ocean'",
+                    ),
+                    Item(
+                        "chlorophyll_mg_m3",
+                        label="Chlorophyll (mg/m3)",
+                        tooltip="Chlorophyll concentration of the water; about 0.03-0.1 in clear open ocean",
+                        enabled_when="surface == 'ocean' and water_body",
+                    ),
+                    visible_when="cloud_source == 'none'",
                 ),
                 HGroup(
                     Item("bomex_netcdf", label="BOMEX file"),
@@ -691,6 +720,9 @@ class SmartgPlayground(HasTraits):
             ozone_dobson=self.ozone_dobson or None,
             water_vapour_g_cm2=self.water_vapour_g_cm2 or None,
             surface_pressure_hpa=self.surface_pressure_hpa or None,
+            # a ticked box that is hidden or greyed out (cloud, land) does not count
+            water_body=self.water_body and self.cloud_source == "none" and self.surface == "ocean",
+            chlorophyll_mg_m3=self.chlorophyll_mg_m3,
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
             acquisition_interval_s=self.acquisition_interval_s,
@@ -729,6 +761,8 @@ class SmartgPlayground(HasTraits):
         self.ozone_dobson = config.ozone_dobson or 0.0
         self.water_vapour_g_cm2 = config.water_vapour_g_cm2 or 0.0
         self.surface_pressure_hpa = config.surface_pressure_hpa or 0.0
+        self.water_body = config.water_body
+        self.chlorophyll_mg_m3 = config.chlorophyll_mg_m3
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor
         self.acquisition_interval_s = config.acquisition_interval_s

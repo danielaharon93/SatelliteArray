@@ -112,12 +112,15 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `band_set` | What a channel is: `"rgb"` (default: single wavelengths, 440 / 550 / 670 nm), `"modis"` (the MODIS Terra channels b03, b04 and b01, simulated as SMART-G REPTRAN bands) or `"grid"` (a grid of wavelengths over a camera's range, with the photons' wavelengths drawn in proportion to response x solar irradiance), see [Band sets](#band-sets). Set it in the GUI with "Band set", or override it for one headless run with `BAND_SET` in `run_from_config.py`. |
 | `grid_range_nm` | `"grid"` only: `[low, high]`, the camera's range in nm (default `[400, 700]`, allowed 300-4000), split into equal thirds for the blue, green and red channels. |
 | `grid_step_nm` | `"grid"` only: width of the wavelength bins in nm (default 10; at most a third of the range). One wavelength is simulated per bin, at its centre. |
-| `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`) or `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)). |
+| `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`), `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)) or `"none"` (no cloud: the clear-sky scene, see [The clear sky](#the-clear-sky)). |
 | `bomex_netcdf` | Path to the BOMEX `…com3D_int_2.nc` file (the one with the `FNCD` droplet spectrum). Required for `"bomex"`. |
 | `extinction_method` | `"q2"` (default: extinction with Q = 2, the paper's approximation) or `"mie"` (the Mie Q of each radius bin). Only used by `"bomex"`. |
 | `bomex_crop_cells` | `0` (default: the whole field) or a square of this many cells (at least 16) around the thickest column. Only used by `"bomex"`. |
 | `phase_function` | Droplet phase function, either cloud source: `"mie"` (default: the water-cloud table of SMART-G) or `"hg"` (Henyey-Greenstein). |
 | `hg_g` | Asymmetry parameter for `"hg"`, in (-1, 1) (default 0.85, typical of water clouds). |
+| `aerosol_model`, `aod_550` | An OPAC aerosol (`"none"` by default, or `"maritime_clean"`, `"maritime_polluted"`, `"maritime_tropical"`, `"continental_clean"`, `"continental_average"`, `"continental_polluted"`, `"urban"`, `"desert"`) with optical depth `aod_550` at 550 nm (0-3, default 0.1). |
+| `ozone_dobson`, `water_vapour_g_cm2`, `surface_pressure_hpa` | `null` (default: the AFGL profile's own) or the ozone column (100-600 DU), water vapour (0.01-10 g/cm²) and surface pressure (500-1100 hPa). |
+| `water_body`, `chlorophyll_mg_m3` | The sea's water body: light enters the water and comes back out (the sea's blue-green colour). Default `false`; `true` needs `"surface": "ocean"` and `"cloud_source": "none"`. `chlorophyll_mg_m3` (default 0.05, up to 10) sets the water's chlorophyll. |
 | `pointing_noise_enabled` | Turn the pointing-error model on. |
 | `sigma_bias_deg`, `sigma_acquisition_deg`, `sigma_drift_deg`, `drift_tau_s`, `sigma_jitter_deg`, `yaw_factor`, `acquisition_interval_s` | Pointing-error parameters (below). |
 | `noise_seed` | Random seed of the Monte-Carlo run. |
@@ -126,6 +129,23 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 The file can be edited by hand. On load it is validated: unknown keys, an unknown
 mode/resolution, out-of-range angles, bad satellite indices, `renders < 1`, a
 wrong `version` and an unparseable `time_utc` are all rejected with a message.
+
+### The clear sky
+
+With `"cloud_source": "none"` there is no cloud: the scene is the atmosphere (molecules and,
+if set, the aerosol) over the sea or the ground. SMART-G computes it in 1D, one run for all
+the views, with a local estimate in each viewing direction. The scene is the same
+everywhere, so each image is **uniform**: one reflectance per channel, repeated over the
+pixels (the `.npy` still has shape `(height, width, channels)`, and the `_spectral.npz` of
+the `"grid"` band set holds `(1, 1, n_wavelengths)`). The resolution and `periodic` do not
+change the result, but total photons = `photons_per_pixel` × pixels still sets the noise of
+the run: about 1% at 1e7 photons. File names end in `_clearsky`, and `_chl<value>` marks a
+water body.
+
+This is the only mode where the sea has its water body (SMART-G's 3D mode fails with it,
+`KeyError: 'iabs_oc'`, also in version 2.0.6). It also works with every band set and with an
+aerosol, which the 3D cloud scenes do not (the grid band set with an aerosol is too heavy
+there). A run with the water body is about ten times slower than the reflecting sea alone.
 
 ### The BOMEX cloud
 
