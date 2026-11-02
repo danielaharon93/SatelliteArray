@@ -80,6 +80,11 @@ from playground_core import (
     CLOUD_SOURCES,
     CONFIG_DIR,
     DEFAULT_AOD_550,
+    GUI_DEFAULT_AEROSOL_MODEL,
+    GUI_DEFAULT_AOD_550,
+    GUI_DEFAULT_OZONE_DOBSON,
+    GUI_DEFAULT_PRESSURE_HPA,
+    GUI_DEFAULT_WATER_VAPOUR_G_CM2,
     DEFAULT_CHLOROPHYLL_MG_M3,
     DEFAULT_HG_G,
     DEFAULT_NOISE_PARAMS,
@@ -159,6 +164,7 @@ class SmartgPlayground(HasTraits):
     cloud_source = Enum(list(CLOUD_SOURCES))
     water_body = Bool(False)
     chlorophyll_mg_m3 = Range(0.001, MAX_CHLOROPHYLL_MG_M3, DEFAULT_CHLOROPHYLL_MG_M3, mode="text")
+    polarization = Bool(False)  # clear sky only: also save the Stokes parameters, DoLP, AoLP
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
     extinction_method = Enum(list(EXTINCTION_METHODS))
@@ -169,10 +175,16 @@ class SmartgPlayground(HasTraits):
     # The atmosphere beyond the cloud (see playground_core.Environment).
     # For the three gas amounts 0 means "the AFGL profile's own value".
     aerosol_model = Enum(list(AEROSOL_MODELS))
-    aod_550 = Range(0.0, MAX_AOD_550, DEFAULT_AOD_550, mode="text")
-    ozone_dobson = Float(0.0)
-    water_vapour_g_cm2 = Float(0.0)
-    surface_pressure_hpa = Float(0.0)
+    # The GUI starts from a typical set taken from SMART-G's demo_notebook.py:
+    # continental_clean aerosol of optical depth 0.3 (its line 1615), ozone 300 DU
+    # (line 717), water vapour 2 g/cm2 (line 312), standard sea-level pressure.
+    aod_550 = Range(0.0, MAX_AOD_550, GUI_DEFAULT_AOD_550, mode="text")
+    ozone_dobson = Float(GUI_DEFAULT_OZONE_DOBSON)
+    water_vapour_g_cm2 = Float(GUI_DEFAULT_WATER_VAPOUR_G_CM2)
+    surface_pressure_hpa = Float(GUI_DEFAULT_PRESSURE_HPA)
+
+    def _aerosol_model_default(self):
+        return GUI_DEFAULT_AEROSOL_MODEL
 
     # Pointing error (see pointing_noise.py). Sigmas are 1 sigma per
     # cross-boresight axis; picking a preset fills them in, editing any of
@@ -323,6 +335,14 @@ class SmartgPlayground(HasTraits):
                         label="Chlorophyll (mg/m3)",
                         tooltip="Chlorophyll concentration of the water; about 0.03-0.1 in clear open ocean",
                         enabled_when="surface == 'ocean' and water_body",
+                    ),
+                    Item(
+                        "polarization",
+                        label="Save polarization",
+                        tooltip=(
+                            "Also save the Stokes parameters (I, Q, U, V) of each channel and the degree "
+                            "and angle of linear polarization (DoLP, AoLP). Costs no extra run time"
+                        ),
                     ),
                     visible_when="cloud_source == 'none'",
                 ),
@@ -723,6 +743,7 @@ class SmartgPlayground(HasTraits):
             # a ticked box that is hidden or greyed out (cloud, land) does not count
             water_body=self.water_body and self.cloud_source == "none" and self.surface == "ocean",
             chlorophyll_mg_m3=self.chlorophyll_mg_m3,
+            polarization=self.polarization and self.cloud_source == "none",
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
             acquisition_interval_s=self.acquisition_interval_s,
@@ -763,6 +784,7 @@ class SmartgPlayground(HasTraits):
         self.surface_pressure_hpa = config.surface_pressure_hpa or 0.0
         self.water_body = config.water_body
         self.chlorophyll_mg_m3 = config.chlorophyll_mg_m3
+        self.polarization = config.polarization
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor
         self.acquisition_interval_s = config.acquisition_interval_s

@@ -85,6 +85,13 @@ DEFAULT_AOD_550 = 0.1
 AEROSOL_N_ICDF = 721
 MAX_AOD_550 = 3.0
 AEROSOL_RH_PERCENT = 80.0  # relative humidity of the aerosol's mixing layer
+# What the GUI's atmosphere fields start with: a typical set from SMART-G's demo_notebook.py
+# (the scripts and saved configs keep their own defaults above).
+GUI_DEFAULT_AEROSOL_MODEL = "continental_clean"
+GUI_DEFAULT_AOD_550 = 0.3
+GUI_DEFAULT_OZONE_DOBSON = 300.0
+GUI_DEFAULT_WATER_VAPOUR_G_CM2 = 2.0
+GUI_DEFAULT_PRESSURE_HPA = 1013.25
 DEFAULT_CHLOROPHYLL_MG_M3 = 0.05
 MAX_CHLOROPHYLL_MG_M3 = 10.0
 
@@ -779,6 +786,7 @@ def render_clear_sky(
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
     spectral_out: dict | None = None,
     environment: Environment | None = None,
+    stokes_out: dict | None = None,
 ) -> list[tuple[np.ndarray, float, float]]:
     """The clear-sky scene: the atmosphere (molecules and, with the environment,
     aerosol) over the surface, no cloud. SMART-G computes it as a plane-parallel 1D
@@ -793,7 +801,10 @@ def render_clear_sky(
     `n_photons` (default: per-pixel photons x pixels) is the total of the one run.
 
     If `spectral_out` is a dict, the reflectance at every simulated wavelength of
-    view i is stored in it under i, as an array of shape (1, 1, n_wavelengths)."""
+    view i is stored in it under i, as an array of shape (1, 1, n_wavelengths).
+    If `stokes_out` is a dict, the polarized reflectance of view i is stored under i as
+    {"channels": (4, height_px, width_px, n_channels), "spectral": (4, 1, 1,
+    n_wavelengths)}: the Stokes parameters I, Q, U, V (see stokes_to_polarization())."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -825,13 +836,42 @@ def render_clear_sky(
     )
     toa = ds["I_up (TOA)"].transpose("Zenith angles", "wavelength").values  # (views, wavelengths)
     channels = spectrum.channels(toa)
+    if stokes_out is not None:
+        # I, Q, U, V come out of the same run; the channel weights are linear, so they
+        # apply to each Stokes parameter alike (DoLP and AoLP follow from the channel values).
+        stokes_toa = np.stack(
+            [ds[f"{name}_up (TOA)"].transpose("Zenith angles", "wavelength").values for name in "IQUV"]
+        )  # (4, views, wavelengths)
+        stokes_channels = np.stack([spectrum.channels(component) for component in stokes_toa])  # (4, views, channels)
     results = []
     for index, (vza_deg, vaa_deg) in enumerate(angles):
         image = np.broadcast_to(channels[index], (height_px, width_px, spectrum.n_channels)).copy()
         results.append((image, vza_deg, vaa_deg))
         if spectral_out is not None:
             spectral_out[index] = toa[index].reshape(1, 1, -1)
+        if stokes_out is not None:
+            stokes_out[index] = {
+                "channels": np.broadcast_to(
+                    stokes_channels[:, index, None, None, :], (4, height_px, width_px, spectrum.n_channels)
+                ).copy(),
+                "spectral": stokes_toa[:, index].reshape(4, 1, 1, -1),
+            }
     return results
+
+
+def stokes_to_polarization(stokes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(4, ...) Stokes parameters I, Q, U, V -> (DoLP, AoLP in degrees), each of shape (...).
+    DoLP = sqrt(Q^2 + U^2) / I is the degree of linear polarization (0 to 1);
+    AoLP = atan2(U, Q) / 2 is the angle of the polarization, in [-90, 90) (a cyclic
+    quantity: -90 and 90 are the same), from the reference plane SMART-G's Q and U are
+    defined against: the meridian plane of the viewing direction (Q < 0 when the light is
+    polarized perpendicular to it, as the Rayleigh sky is in the principal plane, i.e.
+    AoLP = +-90 deg there)."""
+    intensity, q, u = stokes[0], stokes[1], stokes[2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dolp = np.where(intensity > 0, np.hypot(q, u) / intensity, 0.0)
+    aolp = (np.degrees(0.5 * np.arctan2(u, q)) + 90.0) % 180.0 - 90.0
+    return dolp, aolp
 
 
 def render_formation_frozen(
@@ -1009,6 +1049,9 @@ class PlaygroundConfig:
     # ocean surface and no cloud (cloud_source "none"), see validate().
     water_body: bool = False
     chlorophyll_mg_m3: float = DEFAULT_CHLOROPHYLL_MG_M3
+    # Also save the polarization (Stokes I, Q, U, V per channel, DoLP and AoLP): only for
+    # the clear sky (cloud_source "none") so far, see validate().
+    polarization: bool = False
 
     cloud_source: str = CLOUD_BUNDLED
     bomex_netcdf: str = ""
@@ -1085,6 +1128,8 @@ class PlaygroundConfig:
                 "water_body needs the ocean surface and no cloud (cloud_source 'none'): "
                 "SMART-G's 3D mode cannot hold the water body of the sea"
             )
+        if self.polarization and self.cloud_source != CLOUD_NONE:
+            raise ValueError("polarization is only available for the clear sky (cloud_source 'none') so far")
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
             raise ValueError(f"off_nadir_deg must be in [0, {MAX_OFF_NADIR_DEG}]")
         if not all(0 <= i < main.NUM_SATELLITES for i in self.satellites_to_render):
@@ -1410,6 +1455,32 @@ class PlaygroundSimulation:
             spectrum, png_path.with_name(f"{png_path.stem}_wavelength_distribution.svg")
         )
 
+    def _save_polarization(self, config: PlaygroundConfig, stokes: dict | None, png_path: Path) -> str:
+        """Save the polarization of one view next to its image: <name>_stokes.npy (the
+        Stokes parameters I, Q, U, V per channel, shape (4, height, width, channels)), a
+        figure of the degree (DoLP) and angle (AoLP) of linear polarization
+        (<name>_polarization.png), and for the "grid" band set <name>_stokes_spectral.npz
+        (Stokes at every simulated wavelength, shape (4, 1, 1, n_wavelengths)). Returns
+        a line of text with the values, per channel."""
+        if not config.polarization or stokes is None:
+            return ""
+        cube = stokes["channels"]
+        np.save(png_path.with_name(f"{png_path.stem}_stokes.npy"), cube)
+        labels = config_spectrum(config).labels
+        save_polarization_figure(cube, png_path.with_name(f"{png_path.stem}_polarization.png"), png_path.stem, labels)
+        if config.band_set == BAND_SET_GRID:
+            np.savez_compressed(
+                png_path.with_name(f"{png_path.stem}_stokes_spectral.npz"),
+                stokes=stokes["spectral"].astype(np.float32),
+                wavelength_nm=config_spectrum(config).run_wavelength,
+            )
+        dolp, aolp = stokes_to_polarization(cube)
+        center = (cube.shape[1] // 2, cube.shape[2] // 2)
+        return "  ".join(
+            f"{label}: DoLP {100 * dolp[center][i]:.1f}% AoLP {aolp[center][i]:+.0f} deg"
+            for i, label in enumerate(labels)
+        )
+
     def _channel_file_suffix(self, config: PlaygroundConfig) -> str:
         """Names the band set (_modis) and a single-channel render (_blue, _green,
         _red); empty for the original settings."""
@@ -1440,6 +1511,7 @@ class PlaygroundSimulation:
             pointing_summary += "  |  "
 
         spectral: dict = {}
+        stokes: dict = {}
         if cloud is None:
             [(reflectance, vza_deg, vaa_deg)] = render_clear_sky(
                 [(self.position_km, true_point_km)],
@@ -1456,6 +1528,7 @@ class PlaygroundSimulation:
                 grid_step_nm=config.grid_step_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
+                stokes_out=stokes if config.polarization else None,
             )
             spectral["single"] = spectral.get(0)
         else:
@@ -1494,6 +1567,7 @@ class PlaygroundSimulation:
         main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
         np.save(path.with_suffix(".npy"), reflectance)  # raw, un-clipped
         self._save_spectral(config, spectral.get("single"), path)
+        polarization_summary = self._save_polarization(config, stokes.get(0), path)
         figure_path = path.with_name(f"{path.stem}_raw.png")
         save_reflectance_figure(
             reflectance, figure_path, path.stem, gain, config_spectrum(config).labels
@@ -1503,6 +1577,7 @@ class PlaygroundSimulation:
             f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
             f"saved {path} (+ .npy, {figure_path.name})\n"
             f"Raw reflectance:\n{reflectance_stats(reflectance, gain, labels=config_spectrum(config).labels)}"
+            + (f"\nPolarization: {polarization_summary}" if polarization_summary else "")
         )
 
     def _render_formation(
@@ -1530,6 +1605,7 @@ class PlaygroundSimulation:
                 summaries.append(f"Sat {index}: {summary}")
 
         spectral: dict = {}
+        stokes: dict = {}
         if cloud is None:
             views = [
                 (self.formation_positions_km[index], pointing.get(index, (self.formation_target_km, 0.0))[0])
@@ -1550,9 +1626,11 @@ class PlaygroundSimulation:
                 grid_step_nm=config.grid_step_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
+                stokes_out=stokes if config.polarization else None,
             )
             images = {index: image for index, (image, _, _) in zip(satellite_indices, clear)}
             spectral = {index: spectral[position] for position, index in enumerate(satellite_indices)}
+            stokes = {index: stokes[position] for position, index in enumerate(satellite_indices) if position in stokes}
         else:
             images = render_formation_frozen(
                 self.formation_target_km,
@@ -1590,6 +1668,7 @@ class PlaygroundSimulation:
             main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
             np.save(path.with_suffix(".npy"), images[index])  # raw, un-clipped
             self._save_spectral(config, spectral.get(index), path)
+            polarization_summary = self._save_polarization(config, stokes.get(index), path)
             save_reflectance_figure(
                 images[index],
                 path.with_name(f"{path.stem}_raw.png"),
@@ -1599,6 +1678,7 @@ class PlaygroundSimulation:
             )
             summaries.append(
                 f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain, labels=config_spectrum(config).labels)}"
+                + (f"\nSat {index} polarization: {polarization_summary}" if polarization_summary else "")
             )
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])
 
@@ -1818,6 +1898,32 @@ def save_reflectance_figure(
         axis.set_yticks([])
         figure.colorbar(image, ax=axis, shrink=0.8, label="TOA reflectance")
     figure.suptitle(f"{title}  (raw; PNG gain {gain:g} clips at {1 / gain:.3g})")
+    figure.savefig(path, dpi=110)
+
+
+def save_polarization_figure(stokes: np.ndarray, path: Path, title: str, labels: tuple[str, ...] | list[str]) -> None:
+    """Save the degree (top row, percent) and angle (bottom row, degrees, a cyclic
+    colour map) of linear polarization, one column per band, from the (4, height,
+    width, bands) Stokes parameters. See stokes_to_polarization()."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    dolp, aolp = stokes_to_polarization(stokes)
+    n_bands = stokes.shape[-1]
+    vmax = max(100.0 * float(dolp.max()), 1e-6)
+    figure = Figure(figsize=(4.4 * n_bands, 8.6), layout="constrained")
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(2, n_bands, squeeze=False)
+    for band in range(n_bands):
+        top = axes[0][band].imshow(100.0 * dolp[..., band], vmin=0.0, vmax=vmax, cmap="viridis")
+        axes[0][band].set_title(labels[band])
+        figure.colorbar(top, ax=axes[0][band], shrink=0.8, label="DoLP (%)")
+        bottom = axes[1][band].imshow(aolp[..., band], vmin=-90.0, vmax=90.0, cmap="twilight")
+        figure.colorbar(bottom, ax=axes[1][band], shrink=0.8, label="AoLP (deg)")
+        for axis in (axes[0][band], axes[1][band]):
+            axis.set_xticks([])
+            axis.set_yticks([])
+    figure.suptitle(f"{title}  (linear polarization; AoLP from the view's meridian plane)")
     figure.savefig(path, dpi=110)
 
 
