@@ -86,6 +86,7 @@ from playground_core import (
     GUI_DEFAULT_PRESSURE_HPA,
     GUI_DEFAULT_WATER_VAPOUR_G_CM2,
     DEFAULT_CHLOROPHYLL_MG_M3,
+    DEFAULT_SEA_SPECTRUM_FILE,
     DEFAULT_HG_G,
     DEFAULT_NOISE_PARAMS,
     DEFAULT_WIND_SPEED_MS,
@@ -99,6 +100,7 @@ from playground_core import (
     RESOLUTION_PRESETS,
     SINGLE_MODE,
     SURFACES,
+    WATER_MODELS,
     PlaygroundConfig,
     PlaygroundSimulation,
     parse_time_utc,
@@ -164,6 +166,10 @@ class SmartgPlayground(HasTraits):
     cloud_source = Enum(list(CLOUD_SOURCES))
     water_body = Bool(False)
     chlorophyll_mg_m3 = Range(0.001, MAX_CHLOROPHYLL_MG_M3, DEFAULT_CHLOROPHYLL_MG_M3, mode="text")
+    # The water body is a chlorophyll-bearing column of water, or a reflector with a
+    # measured spectrum (a CSV file of wavelength in nm and Rrs in 1/sr).
+    water_model = Enum(list(WATER_MODELS))
+    sea_spectrum_file = Str(DEFAULT_SEA_SPECTRUM_FILE)
     polarization = Bool(False)  # clear sky only: also save the Stokes parameters, DoLP, AoLP
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
@@ -334,7 +340,7 @@ class SmartgPlayground(HasTraits):
                         "chlorophyll_mg_m3",
                         label="Chlorophyll (mg/m3)",
                         tooltip="Chlorophyll concentration of the water; about 0.03-0.1 in clear open ocean",
-                        enabled_when="surface == 'ocean' and water_body",
+                        enabled_when="surface == 'ocean' and water_body and water_model == 'chlorophyll'",
                     ),
                     Item(
                         "polarization",
@@ -343,6 +349,29 @@ class SmartgPlayground(HasTraits):
                             "Also save the Stokes parameters (I, Q, U, V) of each channel and the degree "
                             "and angle of linear polarization (DoLP, AoLP). Costs no extra run time"
                         ),
+                    ),
+                    visible_when="cloud_source == 'none'",
+                ),
+                HGroup(
+                    Item(
+                        "water_model",
+                        label="Water model",
+                        tooltip=(
+                            "chlorophyll: a column of water with chlorophyll (the sea's colour follows from "
+                            "the concentration); measured: the sea has the colour of the spectrum in the file "
+                            "(a reflector under the surface; quicker)"
+                        ),
+                        enabled_when="surface == 'ocean' and water_body",
+                    ),
+                    Item(
+                        "sea_spectrum_file",
+                        label="Sea spectrum (CSV)",
+                        tooltip=(
+                            "Wavelength in nm and Rrs in 1/sr, one pair per line; the default is a very "
+                            "clear-water spectrum measured by MOBY off Hawaii. A relative path starts in "
+                            "the program's folder"
+                        ),
+                        enabled_when="surface == 'ocean' and water_body and water_model == 'measured'",
                     ),
                     visible_when="cloud_source == 'none'",
                 ),
@@ -743,6 +772,8 @@ class SmartgPlayground(HasTraits):
             # a ticked box that is hidden or greyed out (cloud, land) does not count
             water_body=self.water_body and self.cloud_source == "none" and self.surface == "ocean",
             chlorophyll_mg_m3=self.chlorophyll_mg_m3,
+            water_model=self.water_model,
+            sea_spectrum_file=self.sea_spectrum_file,
             polarization=self.polarization and self.cloud_source == "none",
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
@@ -784,6 +815,8 @@ class SmartgPlayground(HasTraits):
         self.surface_pressure_hpa = config.surface_pressure_hpa or 0.0
         self.water_body = config.water_body
         self.chlorophyll_mg_m3 = config.chlorophyll_mg_m3
+        self.water_model = config.water_model
+        self.sea_spectrum_file = config.sea_spectrum_file
         self.polarization = config.polarization
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor

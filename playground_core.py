@@ -94,6 +94,23 @@ GUI_DEFAULT_WATER_VAPOUR_G_CM2 = 2.0
 GUI_DEFAULT_PRESSURE_HPA = 1013.25
 DEFAULT_CHLOROPHYLL_MG_M3 = 0.05
 MAX_CHLOROPHYLL_MG_M3 = 10.0
+# How the sea's water body is represented (Environment.water_model): "chlorophyll" is a
+# column of pure water and chlorophyll-bearing particles (its colour follows from the
+# chlorophyll concentration), "measured" is a diffuse reflector just under the surface
+# (SMART-G's WaterRw) with a measured spectrum, read from a CSV file (wavelength in nm,
+# Rrs in 1/sr): the default is a very clear open-ocean spectrum measured by MOBY.
+WATER_CHLOROPHYLL = "chlorophyll"
+WATER_MEASURED = "measured"
+WATER_MODELS = (WATER_CHLOROPHYLL, WATER_MEASURED)
+DEFAULT_SEA_SPECTRUM_FILE = "configs/sea_colour/moby_clear_water_rrs.csv"
+# Rrs (above the surface) -> the subsurface irradiance reflectance R(0-) that WaterRw takes.
+# Rrs = ZETA * rrs / (1 - GAMMA * rrs) relates it to the subsurface remote-sensing
+# reflectance rrs (Lee et al., 2002, Appl. Opt. 41, 5755), and R(0-) = Q * rrs with
+# Q = Eu/Lu (about 3.4 for clear water at a mid sun angle; pi for a Lambertian
+# reflector). Q varies with the sun angle and the water: a few % in R(0-).
+RRS_ZETA = 0.52
+RRS_GAMMA = 1.7
+SEA_Q_FACTOR = 3.4
 
 DEFAULT_NOISE_PARAMS = pointing_noise.PRESETS[pointing_noise.DEFAULT_PRESET]
 
@@ -387,7 +404,9 @@ class Environment:
     `surface_pressure_hpa` rescale the AFGL profile when not None.
     `water_body` (ocean surface only) lets light through the air-water interface into
     a water column of pure water and chlorophyll-bearing particles
-    (`chlorophyll_mg_m3`), so the sea has its water-leaving light (its colour)."""
+    (`chlorophyll_mg_m3`), so the sea has its water-leaving light (its colour). With
+    `water_model` "measured" the colour is instead that of the measured spectrum in
+    `sea_spectrum_file` (see load_sea_spectrum()), and the chlorophyll is not used."""
 
     aerosol_model: str = AEROSOL_NONE
     aod_550: float = DEFAULT_AOD_550
@@ -397,6 +416,8 @@ class Environment:
     water_body: bool = False
     chlorophyll_mg_m3: float = DEFAULT_CHLOROPHYLL_MG_M3
     atmosphere_profile: str | None = None  # an AFGL profile name; None: main.SMARTG_AFGL_PROFILE
+    water_model: str = WATER_CHLOROPHYLL
+    sea_spectrum_file: str = DEFAULT_SEA_SPECTRUM_FILE  # relative: to this file's folder
 
 
 def build_atmosphere_1d(lat_deg: float, environment: Environment | None = None):
@@ -425,16 +446,59 @@ def smartg_run_options(environment: Environment | None = None) -> dict:
     return {}
 
 
+def load_sea_spectrum(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """(wavelength in nm, Rrs in 1/sr) of a sea spectrum CSV: two columns, `#` lines are
+    comments. A relative path is taken relative to this file's folder."""
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
+    data = np.loadtxt(path, delimiter=",", comments="#", ndmin=2)
+    if data.shape[1] != 2 or data.shape[0] < 2:
+        raise ValueError(f"{path}: expected two columns (wavelength in nm, Rrs in 1/sr) and at least two rows")
+    order = np.argsort(data[:, 0])
+    wavelength_nm, rrs = data[order, 0], data[order, 1]
+    if np.any(np.diff(wavelength_nm) <= 0) or np.any(rrs < 0.0):
+        raise ValueError(f"{path}: wavelengths must be distinct and Rrs not negative")
+    return wavelength_nm, rrs
+
+
+def subsurface_reflectance(rrs: np.ndarray) -> np.ndarray:
+    """The subsurface irradiance reflectance R(0-) = Eu(0-)/Ed(0-) that SMART-G's WaterRw
+    takes, from the remote-sensing reflectance Rrs above the surface (1/sr): see
+    RRS_ZETA, RRS_GAMMA and SEA_Q_FACTOR."""
+    rrs = np.asarray(rrs, dtype=float)
+    subsurface_rrs = rrs / (RRS_ZETA + RRS_GAMMA * rrs)  # inverts Rrs = ZETA rrs / (1 - GAMMA rrs)
+    return SEA_Q_FACTOR * subsurface_rrs
+
+
+def build_sea_reflector(sea_spectrum_file: str):
+    """SMART-G's WaterRw for the measured sea spectrum in `sea_spectrum_file`: a diffuse
+    reflector just under the surface with R(0-) from subsurface_reflectance(). The
+    spectrum is held constant beyond its first and last wavelength (SMART-G would extend
+    it linearly, to negative values)."""
+    from smartg.albedo import AlbedoSpectrum
+    from smartg.water import WaterRw
+
+    wavelength_nm, rrs = load_sea_spectrum(sea_spectrum_file)
+    wavelength_nm = np.concatenate([[100.0], wavelength_nm, [4000.0]])
+    rrs = np.concatenate([[rrs[0]], rrs, [rrs[-1]]])
+    return WaterRw(alb=AlbedoSpectrum(subsurface_reflectance(rrs), wavelength_nm))
+
+
 def build_ocean(surface: str, wind_speed_ms: float, environment: Environment | None = None):
     """(surface, water) to pass to SMART-G. For SURFACE_OCEAN with the environment's
-    `water_body`: a rough sea that also transmits (sur=3) over a Water1D column,
-    so the water-leaving light is simulated; otherwise build_surface() and no water."""
+    `water_body`: a rough sea that also transmits (sur=3), over either a Water1D column
+    (water_model "chlorophyll") or a measured-spectrum reflector (water_model "measured",
+    see build_sea_reflector()), so the water-leaving light is simulated; otherwise
+    build_surface() and no water."""
     environment = environment or Environment()
     if surface == SURFACE_OCEAN and environment.water_body:
         from smartg.surface import RoughSurface
         from smartg.water import HydrosolPR, Water1D
 
         sea = RoughSurface(wind=wind_speed_ms, sur=3, wave_shadow=True)
+        if environment.water_model == WATER_MEASURED:
+            return sea, build_sea_reflector(environment.sea_spectrum_file)
         return sea, Water1D(comp=[HydrosolPR(chl=environment.chlorophyll_mg_m3)])
     return build_surface(surface, wind_speed_ms), None
 
@@ -1049,6 +1113,11 @@ class PlaygroundConfig:
     # ocean surface and no cloud (cloud_source "none"), see validate().
     water_body: bool = False
     chlorophyll_mg_m3: float = DEFAULT_CHLOROPHYLL_MG_M3
+    # How the water body is represented (see WATER_MODELS): "chlorophyll", or "measured": the
+    # sea has the colour of the measured spectrum in `sea_spectrum_file` (a CSV of
+    # wavelength in nm and Rrs in 1/sr; a relative path is taken relative to playground_core.py).
+    water_model: str = WATER_CHLOROPHYLL
+    sea_spectrum_file: str = DEFAULT_SEA_SPECTRUM_FILE
     # Also save the polarization (Stokes I, Q, U, V per channel, DoLP and AoLP): only for
     # the clear sky (cloud_source "none") so far, see validate().
     polarization: bool = False
@@ -1086,6 +1155,8 @@ class PlaygroundConfig:
             surface_pressure_hpa=self.surface_pressure_hpa,
             water_body=self.water_body,
             chlorophyll_mg_m3=self.chlorophyll_mg_m3,
+            water_model=self.water_model,
+            sea_spectrum_file=self.sea_spectrum_file,
         )
 
     def noise_params(self) -> pointing_noise.PointingNoiseParams:
@@ -1128,6 +1199,13 @@ class PlaygroundConfig:
                 "water_body needs the ocean surface and no cloud (cloud_source 'none'): "
                 "SMART-G's 3D mode cannot hold the water body of the sea"
             )
+        if self.water_model not in WATER_MODELS:
+            raise ValueError(f"water_model must be one of {WATER_MODELS}, not {self.water_model!r}")
+        if self.water_body and self.water_model == WATER_MEASURED:
+            try:
+                load_sea_spectrum(self.sea_spectrum_file)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"sea_spectrum_file: {exc}") from exc
         if self.polarization and self.cloud_source != CLOUD_NONE:
             raise ValueError("polarization is only available for the clear sky (cloud_source 'none') so far")
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
@@ -1407,7 +1485,9 @@ class PlaygroundSimulation:
         suffix = ""
         if config.surface == SURFACE_OCEAN:
             suffix += f"_ocean{config.wind_speed_ms:g}ms"
-            if config.water_body:
+            if config.water_body and config.water_model == WATER_MEASURED:
+                suffix += f"_sea-{Path(config.sea_spectrum_file).stem}"
+            elif config.water_body:
                 suffix += f"_chl{config.chlorophyll_mg_m3:g}"
         if config.aerosol_model != AEROSOL_NONE:
             suffix += f"_{config.aerosol_model}{config.aod_550:g}"
