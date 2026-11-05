@@ -1212,9 +1212,11 @@ class PlaygroundConfig:
             acquisition_interval_s=self.acquisition_interval_s,
         )
 
-    def validate(self) -> None:
+    def validate(self, require_dataset: bool = True) -> None:
         """Raise ValueError for a setting no front end could have produced,
-        e.g. a hand-edited config file."""
+        e.g. a hand-edited config file. `require_dataset=False` accepts the bomex
+        cloud without a dataset path: the GUI (on a computer without the dataset) saves
+        such a scenario for a server that has it, and run_bomex_headless.py supplies the path."""
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, not {self.mode!r}")
         if self.resolution not in RESOLUTION_PRESETS:
@@ -1280,7 +1282,7 @@ class PlaygroundConfig:
             raise ValueError("grid_step_nm must be > 0 and at most a third of the grid range")
         if self.cloud_source not in CLOUD_SOURCES:
             raise ValueError(f"cloud_source must be one of {CLOUD_SOURCES}, not {self.cloud_source!r}")
-        if self.cloud_source == CLOUD_BOMEX and not self.bomex_netcdf.strip():
+        if require_dataset and self.cloud_source == CLOUD_BOMEX and not self.bomex_netcdf.strip():
             raise ValueError("bomex_netcdf (the dataset's path) is required for the bomex cloud")
         if self.extinction_method not in EXTINCTION_METHODS:
             raise ValueError(
@@ -1305,7 +1307,7 @@ class PlaygroundConfig:
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     @classmethod
-    def load(cls, path: Path | str) -> "PlaygroundConfig":
+    def load(cls, path: Path | str, require_dataset: bool = True) -> "PlaygroundConfig":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         version = data.pop("version", None)
         if version != CONFIG_VERSION:
@@ -1320,7 +1322,7 @@ class PlaygroundConfig:
         if missing:
             raise ValueError(f"config is missing required setting(s): {', '.join(missing)}")
         config = cls(**data)
-        config.validate()
+        config.validate(require_dataset)
         return config
 
 

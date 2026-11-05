@@ -101,7 +101,7 @@ def has_droplet_spectrum(path: Path) -> bool:
 def main() -> int:
     config_path = resolve(SCENARIO_CONFIG)
     try:
-        base = playground_core.PlaygroundConfig.load(config_path)
+        base = playground_core.PlaygroundConfig.load(config_path, require_dataset=False)
     except (OSError, ValueError) as exc:
         print(f"Could not load {config_path}: {exc}", file=sys.stderr)
         return 2

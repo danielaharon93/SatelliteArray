@@ -885,7 +885,7 @@ class SmartgPlayground(HasTraits):
             return
         try:
             config = self._current_config()
-            config.validate()
+            config.validate(require_dataset=False)  # the dataset may be only on the server that runs it
             config.save(path)
         except Exception as exc:
             self.status_text = f"Could not save configuration: {exc}"
@@ -900,7 +900,7 @@ class SmartgPlayground(HasTraits):
         if path is None:
             return
         try:
-            config = PlaygroundConfig.load(path)
+            config = PlaygroundConfig.load(path, require_dataset=False)
         except Exception as exc:
             self.status_text = f"Could not load configuration: {exc}"
             return
@@ -964,7 +964,7 @@ def run_playground(config_path: Path | None = None) -> None:
         )
         config = None
     else:
-        config = PlaygroundConfig.load(config_path)
+        config = PlaygroundConfig.load(config_path, require_dataset=False)
         simulation = PlaygroundSimulation.from_config(config)
     app = SmartgPlayground(simulation, config)
     app.configure_traits()
