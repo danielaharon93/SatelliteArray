@@ -1,0 +1,13 @@
+# Median remote-sensing reflectance Rrs (1/sr, above the surface, Lw/Es) of 207 in-situ stations with chlorophyll a
+# between 1.5 and 4 mg/m3 (median 2.52; fluorometric chlorophyll, HPLC where that is missing).
+# Source: NOMAD, the NASA bio-Optical Marine Algorithm Dataset, version 2.0 alpha (18 July 2008),
+#   https://seabass.gsfc.nasa.gov/wiki/NOMAD/nomad_seabass_v2.a_2008200.txt
+# Citation: Werdell, P. J. and Bailey, S. W. (2005), Remote Sens. Environ. 98, 122-140 (NASA OBPG, SeaBASS; contributors named in the data file).
+# Only the six wavelengths below were used (stations with all six valid); the median is taken band by band, so it is not one station's spectrum.
+# Columns: wavelength_nm, rrs_per_sr
+411,0.002674
+443,0.003000
+489,0.004300
+510,0.004900
+555,0.005700
+670,0.001300
