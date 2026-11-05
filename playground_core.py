@@ -101,7 +101,17 @@ MAX_CHLOROPHYLL_MG_M3 = 10.0
 # Rrs in 1/sr): the default is a very clear open-ocean spectrum measured by MOBY.
 WATER_CHLOROPHYLL = "chlorophyll"
 WATER_MEASURED = "measured"
-WATER_MODELS = (WATER_CHLOROPHYLL, WATER_MEASURED)
+# "matte" is the same measured spectrum as a flat Lambertian surface, a "painted sea" with
+# albedo pi * Rrs + an offset (MATTE_OFFSET_*): no glint, no Fresnel reflection (so no
+# polarization from the sea surface), but SMART-G's 3D mode accepts it, so it works with a cloud.
+WATER_MATTE = "matte"
+WATER_MODELS = (WATER_CHLOROPHYLL, WATER_MEASURED, WATER_MATTE)
+# The offset stands for the sky light the real sea reflects, which pi * Rrs leaves out. It is the
+# constant that made the matte sea match the full model ("measured") in the three MODIS bands, for
+# the sun zenith 39 deg, view zenith 13 deg geometry of the test pixel (see theory/SMARTG_sea_model.pdf):
+# it depends on the geometry, and is held constant outside these wavelengths.
+MATTE_OFFSET_WAVELENGTH_NM = (469.0, 555.0, 645.0)
+MATTE_OFFSET = (0.0104, 0.0047, 0.0029)
 DEFAULT_SEA_SPECTRUM_FILE = "configs/sea_colour/moby_clear_water_rrs.csv"
 # Rrs (above the surface) -> the subsurface irradiance reflectance R(0-) that WaterRw takes.
 # Rrs = ZETA * rrs / (1 - GAMMA * rrs) relates it to the subsurface remote-sensing
@@ -418,6 +428,7 @@ class Environment:
     atmosphere_profile: str | None = None  # an AFGL profile name; None: main.SMARTG_AFGL_PROFILE
     water_model: str = WATER_CHLOROPHYLL
     sea_spectrum_file: str = DEFAULT_SEA_SPECTRUM_FILE  # relative: to this file's folder
+    matte_offset: float | None = None  # water_model "matte": the albedo offset, None = MATTE_OFFSET
 
 
 def build_atmosphere_1d(lat_deg: float, environment: Environment | None = None):
@@ -485,13 +496,38 @@ def build_sea_reflector(sea_spectrum_file: str):
     return WaterRw(alb=AlbedoSpectrum(subsurface_reflectance(rrs), wavelength_nm))
 
 
+def build_matte_sea(sea_spectrum_file: str, matte_offset: float | None = None):
+    """SMART-G's LambSurface for the "matte" sea: a flat diffuse surface of albedo
+    pi * Rrs + offset for the measured Rrs spectrum of `sea_spectrum_file`. pi * Rrs
+    reproduces the measured water-leaving radiance (a Lambertian surface of albedo A under an
+    irradiance E sends the radiance A E / pi); the offset stands for the sky light the real sea
+    reflects, which depends on how bright the sky is. `matte_offset` is that offset, the same
+    at every wavelength; None: the per-wavelength MATTE_OFFSET fitted for a clear sky. There
+    is no rough sea, so no glint and no Fresnel reflection (and no polarization from the sea
+    surface). The spectrum is held constant beyond its first and last wavelength."""
+    from smartg.albedo import AlbedoSpectrum
+    from smartg.surface import LambSurface
+
+    wavelength_nm, rrs = load_sea_spectrum(sea_spectrum_file)
+    wavelength_nm = np.concatenate([[100.0], wavelength_nm, [4000.0]])
+    rrs = np.concatenate([[rrs[0]], rrs, [rrs[-1]]])
+    if matte_offset is None:
+        offset = np.interp(wavelength_nm, MATTE_OFFSET_WAVELENGTH_NM, MATTE_OFFSET)  # held constant outside
+    else:
+        offset = matte_offset
+    return LambSurface(alb=AlbedoSpectrum(np.pi * rrs + offset, wavelength_nm))
+
+
 def build_ocean(surface: str, wind_speed_ms: float, environment: Environment | None = None):
     """(surface, water) to pass to SMART-G. For SURFACE_OCEAN with the environment's
     `water_body`: a rough sea that also transmits (sur=3), over either a Water1D column
     (water_model "chlorophyll") or a measured-spectrum reflector (water_model "measured",
-    see build_sea_reflector()), so the water-leaving light is simulated; otherwise
-    build_surface() and no water."""
+    see build_sea_reflector()), so the water-leaving light is simulated; or, for water_model
+    "matte", a Lambertian surface (build_matte_sea()) and no water; otherwise build_surface()
+    and no water."""
     environment = environment or Environment()
+    if surface == SURFACE_OCEAN and environment.water_body and environment.water_model == WATER_MATTE:
+        return build_matte_sea(environment.sea_spectrum_file, environment.matte_offset), None
     if surface == SURFACE_OCEAN and environment.water_body:
         from smartg.surface import RoughSurface
         from smartg.water import HydrosolPR, Water1D
@@ -647,10 +683,11 @@ def build_scene_3d(
         field["z_bounds"].values,
         **grid_kwargs,
     )
-    if environment is not None and environment.water_body:
+    if environment is not None and environment.water_body and environment.water_model != WATER_MATTE:
         raise NotImplementedError(
             "The water body of the sea is not supported in the 3D render: SMART-G's 3D mode failed with it "
-            "(KeyError 'iabs_oc'). Use run_clear_ocean.py for a cloud-free scene with the water body."
+            "(KeyError 'iabs_oc'). Use water_model 'matte' for a sea colour with a cloud, or a cloud-free scene "
+            "for the water body."
         )
     atm_1d = build_atmosphere_1d(lat_deg, environment)
     atmosphere = Atm3D(atm_1d=atm_1d, grid_3d=grid_3d, comp_3d=[cloud_3d])
@@ -1118,6 +1155,10 @@ class PlaygroundConfig:
     # wavelength in nm and Rrs in 1/sr; a relative path is taken relative to playground_core.py).
     water_model: str = WATER_CHLOROPHYLL
     sea_spectrum_file: str = DEFAULT_SEA_SPECTRUM_FILE
+    # water_model "matte" only: the albedo offset added to pi * Rrs (the sky light the sea
+    # reflects), the same at every wavelength; None: MATTE_OFFSET, fitted for a clear sky.
+    # About 0.02-0.03 suits an overcast sky (see theory/SMARTG_sea_model.pdf).
+    matte_offset: float | None = None
     # Also save the polarization (Stokes I, Q, U, V per channel, DoLP and AoLP): only for
     # the clear sky (cloud_source "none") so far, see validate().
     polarization: bool = False
@@ -1157,6 +1198,7 @@ class PlaygroundConfig:
             chlorophyll_mg_m3=self.chlorophyll_mg_m3,
             water_model=self.water_model,
             sea_spectrum_file=self.sea_spectrum_file,
+            matte_offset=self.matte_offset,
         )
 
     def noise_params(self) -> pointing_noise.PointingNoiseParams:
@@ -1194,14 +1236,18 @@ class PlaygroundConfig:
                 raise ValueError(f"{name} must be in [{low:g}, {high:g}] or null")
         if not 0.0 < self.chlorophyll_mg_m3 <= MAX_CHLOROPHYLL_MG_M3:
             raise ValueError(f"chlorophyll_mg_m3 must be in (0, {MAX_CHLOROPHYLL_MG_M3:g}]")
-        if self.water_body and (self.surface != SURFACE_OCEAN or self.cloud_source != CLOUD_NONE):
-            raise ValueError(
-                "water_body needs the ocean surface and no cloud (cloud_source 'none'): "
-                "SMART-G's 3D mode cannot hold the water body of the sea"
-            )
         if self.water_model not in WATER_MODELS:
             raise ValueError(f"water_model must be one of {WATER_MODELS}, not {self.water_model!r}")
-        if self.water_body and self.water_model == WATER_MEASURED:
+        if self.water_body and self.surface != SURFACE_OCEAN:
+            raise ValueError("water_body needs the ocean surface")
+        if self.water_body and self.cloud_source != CLOUD_NONE and self.water_model != WATER_MATTE:
+            raise ValueError(
+                "with a cloud the water body needs water_model 'matte': SMART-G's 3D mode cannot hold "
+                f"the water column of the sea ('{self.water_model}' needs cloud_source 'none')"
+            )
+        if self.matte_offset is not None and not 0.0 <= self.matte_offset <= 0.1:
+            raise ValueError("matte_offset must be in [0, 0.1] or null")
+        if self.water_body and self.water_model in (WATER_MEASURED, WATER_MATTE):
             try:
                 load_sea_spectrum(self.sea_spectrum_file)
             except (OSError, ValueError) as exc:
@@ -1485,8 +1531,8 @@ class PlaygroundSimulation:
         suffix = ""
         if config.surface == SURFACE_OCEAN:
             suffix += f"_ocean{config.wind_speed_ms:g}ms"
-            if config.water_body and config.water_model == WATER_MEASURED:
-                suffix += f"_sea-{Path(config.sea_spectrum_file).stem}"
+            if config.water_body and config.water_model in (WATER_MEASURED, WATER_MATTE):
+                suffix += f"_{config.water_model}-{Path(config.sea_spectrum_file).stem}"
             elif config.water_body:
                 suffix += f"_chl{config.chlorophyll_mg_m3:g}"
         if config.aerosol_model != AEROSOL_NONE:

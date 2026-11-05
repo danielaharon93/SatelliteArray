@@ -170,6 +170,7 @@ class SmartgPlayground(HasTraits):
     # measured spectrum (a CSV file of wavelength in nm and Rrs in 1/sr).
     water_model = Enum(list(WATER_MODELS))
     sea_spectrum_file = Str(DEFAULT_SEA_SPECTRUM_FILE)
+    matte_offset = Float(0.0)  # water_model "matte": 0 means the clear-sky table (config: None)
     polarization = Bool(False)  # clear sky only: also save the Stokes parameters, DoLP, AoLP
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
@@ -331,8 +332,9 @@ class SmartgPlayground(HasTraits):
                         "water_body",
                         label="Sea water body",
                         tooltip=(
-                            "Light enters the sea and comes back out (water-leaving light: the blue-green "
-                            "colour of the sea). Needs the ocean surface; costs much more run time"
+                            "The sea has its own colour (water-leaving light). Needs the ocean surface. With a cloud only "
+                            "the 'matte' water model works (SMART-G's 3D mode cannot hold a water body); cloud-free, "
+                            "the other models cost more run time"
                         ),
                         enabled_when="surface == 'ocean'",
                     ),
@@ -349,8 +351,9 @@ class SmartgPlayground(HasTraits):
                             "Also save the Stokes parameters (I, Q, U, V) of each channel and the degree "
                             "and angle of linear polarization (DoLP, AoLP). Costs no extra run time"
                         ),
+                        visible_when="cloud_source == 'none'",
                     ),
-                    visible_when="cloud_source == 'none'",
+                    visible_when="surface == 'ocean'",
                 ),
                 HGroup(
                     Item(
@@ -359,7 +362,8 @@ class SmartgPlayground(HasTraits):
                         tooltip=(
                             "chlorophyll: a column of water with chlorophyll (the sea's colour follows from "
                             "the concentration); measured: the sea has the colour of the spectrum in the file "
-                            "(a reflector under the surface; quicker)"
+                            "(a reflector under the surface; quicker); matte: the same spectrum as a flat matte "
+                            "surface (no glint, no sea-surface polarization), the only one that works with a cloud"
                         ),
                         enabled_when="surface == 'ocean' and water_body",
                     ),
@@ -371,9 +375,18 @@ class SmartgPlayground(HasTraits):
                             "clear-water spectrum measured by MOBY off Hawaii. A relative path starts in "
                             "the program's folder"
                         ),
-                        enabled_when="surface == 'ocean' and water_body and water_model == 'measured'",
+                        enabled_when="surface == 'ocean' and water_body and water_model != 'chlorophyll'",
                     ),
-                    visible_when="cloud_source == 'none'",
+                    Item(
+                        "matte_offset",
+                        label="Matte offset",
+                        tooltip=(
+                            "Matte model: the albedo added to pi x Rrs for the sky light a real sea reflects. 0 uses the "
+                            "values fitted for a clear sky (0.003-0.010); about 0.02-0.03 suits an overcast sky"
+                        ),
+                        enabled_when="surface == 'ocean' and water_body and water_model == 'matte'",
+                    ),
+                    visible_when="surface == 'ocean'",
                 ),
                 HGroup(
                     Item("bomex_netcdf", label="BOMEX file"),
@@ -770,10 +783,13 @@ class SmartgPlayground(HasTraits):
             water_vapour_g_cm2=self.water_vapour_g_cm2 or None,
             surface_pressure_hpa=self.surface_pressure_hpa or None,
             # a ticked box that is hidden or greyed out (cloud, land) does not count
-            water_body=self.water_body and self.cloud_source == "none" and self.surface == "ocean",
+            # a ticked box that is hidden or greyed out (land) does not count; with a cloud only the
+            # matte model is valid, validate() says so otherwise
+            water_body=self.water_body and self.surface == "ocean",
             chlorophyll_mg_m3=self.chlorophyll_mg_m3,
             water_model=self.water_model,
             sea_spectrum_file=self.sea_spectrum_file,
+            matte_offset=self.matte_offset or None,
             polarization=self.polarization and self.cloud_source == "none",
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
@@ -817,6 +833,7 @@ class SmartgPlayground(HasTraits):
         self.chlorophyll_mg_m3 = config.chlorophyll_mg_m3
         self.water_model = config.water_model
         self.sea_spectrum_file = config.sea_spectrum_file
+        self.matte_offset = config.matte_offset or 0.0
         self.polarization = config.polarization
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor
