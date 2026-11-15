@@ -29,6 +29,10 @@ import pointing_noise
 
 OUTPUT_DIR = Path(__file__).with_name("smartg_playground_images")
 CONFIG_DIR = Path(__file__).with_name("configs")
+# True: every saved image also gets its radiance (W m-2 um-1 sr-1) next to the
+# reflectance, as <name>_radiance.npy and <name>_radiance.json. A module setting,
+# not a scenario one: run_bomex_headless.py turns it on.
+SAVE_RADIANCE = False
 
 # Small/fast presets for quick iteration - this is a sandbox, not the
 # production renderer (see main.SMARTG_3D_RESOLUTION_PRESETS for that).
@@ -221,6 +225,10 @@ class Spectrum:
     # with radii rounded to 0.1 um need tens of GB; the grid band set rounds to
     # 1 um, the spacing of SMART-G's own water-cloud table.
     reff_acc: int | None = None
+    # The solar irradiance (mW m-2 nm-1, the same numbers as W m-2 um-1) that each channel's
+    # reflectance is relative to: the response-weighted mean over the channel. With the
+    # reflectance it gives the channel's radiance, see radiance_from_reflectance().
+    channel_irradiance: np.ndarray | None = None
 
     @property
     def n_channels(self) -> int:
@@ -245,6 +253,29 @@ def camera_response(wavelength_nm: np.ndarray) -> np.ndarray:
     its whole range); replace the body, e.g. with an interpolated curve, to use
     a real camera. Only relative values matter."""
     return np.ones_like(np.asarray(wavelength_nm, dtype=float))
+
+
+def solar_irradiance_at(wavelength_nm: np.ndarray) -> np.ndarray:
+    """Extraterrestrial solar irradiance (mW m-2 nm-1) at the given wavelengths,
+    interpolated between the values SMART-G's solar REPTRAN file stores."""
+    from smartg.reptran import Reptran
+
+    reptran = Reptran(SOLAR_REPTRAN_FILE)
+    order = np.argsort(reptran.wvl)
+    return np.interp(
+        np.asarray(wavelength_nm, float),
+        np.asarray(reptran.wvl, float)[order],
+        np.asarray(reptran.extra, float)[order],
+    )
+
+
+def radiance_from_reflectance(reflectance: np.ndarray, sza_deg: float, spectrum: "Spectrum") -> np.ndarray:
+    """The radiance (W m-2 um-1 sr-1, the unit of MODIS L1B radiances) that the
+    reflectance (last axis: the spectrum's channels) stands for:
+        L = reflectance * E0 * cos(sza) / pi
+    with E0 the channel's mean solar irradiance (`spectrum.channel_irradiance`).
+    The sun is taken at one astronomical unit (no Earth-Sun distance factor)."""
+    return np.asarray(reflectance) * spectrum.channel_irradiance * np.cos(np.radians(sza_deg)) / np.pi
 
 
 @functools.lru_cache(maxsize=32)
@@ -279,7 +310,9 @@ def make_spectrum(
         raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
     if band_set == BAND_SET_RGB:
         wavelengths = channel_wavelengths_nm(channel)
-        return Spectrum(tuple(f"{w:.0f} nm" for w in wavelengths), wavelengths)
+        return Spectrum(
+            tuple(f"{w:.0f} nm" for w in wavelengths), wavelengths, channel_irradiance=solar_irradiance_at(wavelengths)
+        )
     if band_set == BAND_SET_GRID:
         return _grid_spectrum(channel, tuple(grid_range_nm), float(grid_step_nm))
     if band_set != BAND_SET_MODIS:
@@ -299,11 +332,15 @@ def make_spectrum(
     channel_of = {MODIS_CHANNELS[name]: k for k, name in enumerate(wanted)}
     group = np.array([channel_of[re.search(r"modis_terra_b\d\d", str(i.band.name)).group(0)] for i in internal])
     weight = np.array([float(i.weight) * float(i.extra) for i in internal])
+    quadrature = np.array([float(i.weight) for i in internal])
+    irradiance = np.array(
+        [weight[group == k].sum() / quadrature[group == k].sum() for k in range(len(wanted))]
+    )  # the quadrature-weighted mean of the solar irradiance over each channel's internal bands
     labels = []
     for name in wanted:
         band = reptran.band(by_name[MODIS_CHANNELS[name]])
         labels.append(f"MODIS {MODIS_CHANNELS[name][-3:]} ({band.wmin:.0f}-{band.wmax:.0f} nm)")
-    return Spectrum(tuple(labels), BandSet(internal), group, weight)
+    return Spectrum(tuple(labels), BandSet(internal), group, weight, channel_irradiance=irradiance)
 
 
 def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_nm: float) -> Spectrum:
@@ -339,16 +376,23 @@ def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_n
         share += (w / w.sum() / len(wanted)).tolist()
         labels.append(f"grid {start:.0f}-{stop:.0f} nm")
     share = np.array(share)
+    group, weight, solar = np.array(group), np.array(weight), np.array(solar)
+    # weight = response x solar x width, so response x width = weight / solar and the
+    # response-weighted mean of the solar irradiance over a channel is sum(weight) / sum(weight / solar)
+    irradiance = np.array(
+        [weight[group == k].sum() / (weight[group == k] / solar[group == k]).sum() for k in range(len(wanted))]
+    )
     return Spectrum(
         tuple(labels),
         np.array(centres),
-        np.array(group),
-        np.array(weight),
+        group,
+        weight,
         icdf(share).astype(np.int64),
         share,
-        np.array(solar),
+        solar,
         np.array(width),
         reff_acc=GRID_REFF_ACC,
+        channel_irradiance=irradiance,
     )
 
 
@@ -1583,6 +1627,28 @@ class PlaygroundSimulation:
             spectrum, png_path.with_name(f"{png_path.stem}_wavelength_distribution.svg")
         )
 
+    def _save_radiance(self, config: PlaygroundConfig, reflectance: np.ndarray, png_path: Path) -> str:
+        """With SAVE_RADIANCE, save the radiance of one view next to its reflectance:
+        <name>_radiance.npy (W m-2 um-1 sr-1, the shape of the reflectance image) and
+        <name>_radiance.json (the unit, the channels, the irradiance and sun zenith
+        angle that turn the reflectance into it). Returns a line of text, or ""."""
+        if not SAVE_RADIANCE:
+            return ""
+        spectrum = config_spectrum(config)
+        radiance = radiance_from_reflectance(reflectance, config.sza_deg, spectrum)
+        np.save(png_path.with_name(f"{png_path.stem}_radiance.npy"), radiance)
+        description = {
+            "unit": "W m-2 um-1 sr-1 (the unit of MODIS L1B radiances)",
+            "formula": "radiance = reflectance * channel_irradiance * cos(sza) / pi",
+            "channels": list(spectrum.labels),
+            "channel_irradiance_mW_m2_nm": [float(e) for e in spectrum.channel_irradiance],
+            "sza_deg": config.sza_deg,
+            "sun_distance": "1 astronomical unit (no Earth-Sun distance factor)",
+        }
+        png_path.with_name(f"{png_path.stem}_radiance.json").write_text(json.dumps(description, indent=2))
+        means = ", ".join(f"{label} {float(radiance[..., k].mean()):.1f}" for k, label in enumerate(spectrum.labels))
+        return f"Mean radiance (W m-2 um-1 sr-1): {means}"
+
     def _save_polarization(self, config: PlaygroundConfig, stokes: dict | None, png_path: Path) -> str:
         """Save the polarization of one view next to its image: <name>_stokes.npy (the
         Stokes parameters I, Q, U, V per channel, shape (4, height, width, channels)), a
@@ -1695,6 +1761,7 @@ class PlaygroundSimulation:
         main.reflectance_to_image(reflectance, gain=gain, gamma=1.8).save(path)
         np.save(path.with_suffix(".npy"), reflectance)  # raw, un-clipped
         self._save_spectral(config, spectral.get("single"), path)
+        radiance_summary = self._save_radiance(config, reflectance, path)
         polarization_summary = self._save_polarization(config, stokes.get(0), path)
         figure_path = path.with_name(f"{path.stem}_raw.png")
         save_reflectance_figure(
@@ -1705,6 +1772,7 @@ class PlaygroundSimulation:
             f"Ground VZA={vza_deg:.1f} VAA={vaa_deg:.1f} deg at point a  |  "
             f"saved {path} (+ .npy, {figure_path.name})\n"
             f"Raw reflectance:\n{reflectance_stats(reflectance, gain, labels=config_spectrum(config).labels)}"
+            + (f"\n{radiance_summary}" if radiance_summary else "")
             + (f"\nPolarization: {polarization_summary}" if polarization_summary else "")
         )
 
@@ -1796,6 +1864,7 @@ class PlaygroundSimulation:
             main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
             np.save(path.with_suffix(".npy"), images[index])  # raw, un-clipped
             self._save_spectral(config, spectral.get(index), path)
+            radiance_summary = self._save_radiance(config, images[index], path)
             polarization_summary = self._save_polarization(config, stokes.get(index), path)
             save_reflectance_figure(
                 images[index],
@@ -1806,6 +1875,7 @@ class PlaygroundSimulation:
             )
             summaries.append(
                 f"Sat {index} raw reflectance:\n{reflectance_stats(images[index], gain, labels=config_spectrum(config).labels)}"
+                + (f"\nSat {index} {radiance_summary[0].lower()}{radiance_summary[1:]}" if radiance_summary else "")
                 + (f"\nSat {index} polarization: {polarization_summary}" if polarization_summary else "")
             )
         return "\n".join([f"Saved {len(images)} image(s) to {subdir}", *summaries])

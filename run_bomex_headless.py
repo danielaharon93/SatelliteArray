@@ -58,6 +58,13 @@ CROP_CELLS = 0
 # False: only build the cloud files (no GPU, no SMART-G needed).
 RENDER = True
 
+# True: besides each image's reflectance (<name>.npy, as always), also save its
+# radiance in W m-2 um-1 sr-1, the unit of MODIS L1B radiances: <name>_radiance.npy,
+# with <name>_radiance.json (the solar irradiance per channel and the sun zenith
+# angle that turn the reflectance into it). The radiance is the reflectance times the
+# channel's mean solar irradiance times cos(sun zenith) / pi.
+SAVE_RADIANCE = True
+
 # Where things are written: the cloud files (one per dataset and setting, reused
 # on later runs), and the images (one subfolder per dataset).
 GENERATED_CLOUD_DIR = "generated_clouds"
@@ -116,6 +123,7 @@ def main() -> int:
         return 2
 
     playground_core.GENERATED_CLOUD_DIR = resolve(GENERATED_CLOUD_DIR)
+    playground_core.SAVE_RADIANCE = SAVE_RADIANCE
     output_root = resolve(OUTPUT_DIR)
     print(f"{len(datasets)} BOMEX file(s); extinction {EXTINCTION_METHOD}, "
           f"crop {CROP_CELLS or 'none'}, phase {PHASE_FUNCTION}, render {RENDER}")

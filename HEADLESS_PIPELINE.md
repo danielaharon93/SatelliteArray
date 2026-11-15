@@ -175,6 +175,15 @@ failing file does not stop the others, and the exit code is 1 if any failed. The
 function is always SMART-G's Mie one. With `RENDER = False` it only builds the cloud
 files, which needs no GPU.
 
+With `SAVE_RADIANCE = True` (the default there) every image also gets its **radiance**
+next to the reflectance: `<name>_radiance.npy`, the same shape as `<name>.npy`, in
+W m⁻² µm⁻¹ sr⁻¹ (the unit of MODIS L1B radiances), and `<name>_radiance.json` with the
+channel names, each channel's mean solar irradiance and the sun zenith angle. The radiance
+is `reflectance × E0 × cos(sun zenith) / π`, with E0 the channel's response-weighted mean
+solar irradiance (at one astronomical unit, no Earth-Sun distance factor). The reflectance
+files are unchanged. The GUI and `run_from_config.py` do not write it (it is the module
+setting `playground_core.SAVE_RADIANCE`, off by default).
+
 ### Band sets
 
 `band_set` decides what each image channel is.
