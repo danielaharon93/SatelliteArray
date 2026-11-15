@@ -67,7 +67,7 @@ from mayavi.core.ui.api import MayaviScene, MlabSceneModel, SceneEditor
 from pyface.api import GUI, OK, FileDialog
 from skyfield.api import load
 from traits.api import Bool, Button, Enum, Float, HasTraits, Instance, Int, List, Range, Str, observe
-from traitsui.api import CheckListEditor, HGroup, Item, VGroup, View
+from traitsui.api import CheckListEditor, HGroup, Item, Tabbed, VGroup, View
 
 import main
 import pointing_noise
@@ -112,6 +112,14 @@ POINT_A_MARKER_SCALE_KM = MARKER_SCALE_KM * 0.6
 # Length of the target -> sun arrow; the sun is effectively infinitely far
 # away, so only its direction means anything, this just sets how visible it is.
 SUN_ARROW_LENGTH_KM = 1500.0
+
+
+# Where the two windows open, in pixels from the screen's top-left corner, and the scene
+# window's size: the settings window on the left, the scene next to it.
+CONTROLS_WINDOW_POSITION = (0, 30)
+CONTROLS_WINDOW_WIDTH = 740
+SCENE_WINDOW_POSITION = (760, 30)
+SCENE_WINDOW_SIZE = (900, 700)
 
 
 class SmartgPlayground(HasTraits):
@@ -224,17 +232,24 @@ class SmartgPlayground(HasTraits):
     estimate_voxels_button = Button("Voxels per pixel")
     status_text = Str()
 
-    view = View(
+    # Two windows on the same object: the scene illustration, and the settings. They are
+    # separate so that the settings, which are many, never overlap the animation.
+    scene_view = View(
+        Item("scene", editor=SceneEditor(scene_class=MayaviScene), show_label=False),
+        resizable=True,
+        width=SCENE_WINDOW_SIZE[0],
+        height=SCENE_WINDOW_SIZE[1],
+        x=SCENE_WINDOW_POSITION[0],
+        y=SCENE_WINDOW_POSITION[1],
+        title="SMART-G Playground - scene",
+    )
+
+    controls_view = View(
         VGroup(
-            Item(
-                "scene",
-                editor=SceneEditor(scene_class=MayaviScene),
-                height=380,  # short enough for the whole window, status line included, to fit a 1080p screen
-                width=900,
-                show_label=False,
-            ),
+          Tabbed(
+            VGroup(
             Item("mode", label="Sandbox mode"),
-            HGroup(
+            VGroup(
                 Item("off_nadir_deg", label="Off-nadir angle (deg)"),
                 Item("view_azimuth_deg", label="View azimuth (deg)"),
                 visible_when="mode == 'Single satellite'",
@@ -249,17 +264,22 @@ class SmartgPlayground(HasTraits):
                 ),
                 visible_when="mode == 'Formation (frozen)'",
             ),
-            HGroup(
+            VGroup(
                 Item("sza_deg", label="Sun zenith angle (deg)"),
                 Item("saa_deg", label="Sun azimuth (deg)"),
             ),
-            HGroup(
+            label="View",
+            ),
+            VGroup(
+            VGroup(
                 Item("surface", label="Surface"),
                 Item(
                     "wind_speed_ms",
                     label="Wind speed (m/s)",
                     enabled_when="surface == 'ocean'",
                 ),
+            ),
+            VGroup(
                 Item(
                     "band_set",
                     label="Band set",
@@ -278,7 +298,7 @@ class SmartgPlayground(HasTraits):
                     ),
                 ),
             ),
-            HGroup(
+            VGroup(
                 Item("grid_range_low_nm", label="Camera range from (nm)"),
                 Item("grid_range_high_nm", label="to (nm)"),
                 Item(
@@ -288,23 +308,18 @@ class SmartgPlayground(HasTraits):
                 ),
                 visible_when="band_set == 'grid'",
             ),
-            HGroup(
+            VGroup(
                 Item("periodic", label="Periodic domain", enabled_when="cloud_source != 'none'"),
                 Item("resolution", label="Image resolution"),
-                Item("photons_per_pixel", label="Photons per pixel"),
-                Item("display_gain", label="Display gain"),
-                Item(
-                    "estimate_voxels_button",
-                    show_label=False,
-                    tooltip=(
-                        "Estimate how many voxels one pixel's footprint covers at the chosen "
-                        "resolution, and how many voxels neighbouring pixels share - without rendering"
-                    ),
-                ),
-                Item("render_button", show_label=False),
             ),
             VGroup(
-                HGroup(
+                Item("photons_per_pixel", label="Photons per pixel"),
+                Item("display_gain", label="Display gain"),
+            ),
+            label="Image",
+            ),
+            VGroup(
+                VGroup(
                     Item(
                         "cloud_source",
                         label="Cloud",
@@ -327,7 +342,7 @@ class SmartgPlayground(HasTraits):
                         enabled_when="phase_function == 'hg' and cloud_source != 'none'",
                     ),
                 ),
-                HGroup(
+                VGroup(
                     Item(
                         "water_body",
                         label="Sea water body",
@@ -355,7 +370,7 @@ class SmartgPlayground(HasTraits):
                     ),
                     visible_when="surface == 'ocean'",
                 ),
-                HGroup(
+                VGroup(
                     Item(
                         "water_model",
                         label="Water model",
@@ -388,12 +403,12 @@ class SmartgPlayground(HasTraits):
                     ),
                     visible_when="surface == 'ocean'",
                 ),
-                HGroup(
+                VGroup(
                     Item("bomex_netcdf", label="BOMEX file"),
                     Item("bomex_browse_button", show_label=False),
                     visible_when="cloud_source == 'bomex'",
                 ),
-                HGroup(
+                VGroup(
                     Item(
                         "extinction_method",
                         label="Extinction",
@@ -406,11 +421,10 @@ class SmartgPlayground(HasTraits):
                     ),
                     visible_when="cloud_source == 'bomex'",
                 ),
-                label="Cloud",
-                show_border=True,
+                label="Cloud, sea",
             ),
             VGroup(
-                HGroup(
+                VGroup(
                     Item(
                         "aerosol_model",
                         label="Aerosol",
@@ -422,6 +436,8 @@ class SmartgPlayground(HasTraits):
                         enabled_when="aerosol_model != 'none'",
                         tooltip="Aerosol optical depth at 550 nm; about 0.05-0.15 over the clean ocean",
                     ),
+                ),
+                VGroup(
                     Item(
                         "ozone_dobson",
                         label="Ozone (DU)",
@@ -432,6 +448,8 @@ class SmartgPlayground(HasTraits):
                         label="Water vapour (g/cm2)",
                         tooltip="Precipitable water vapour; 0 keeps the AFGL profile's own",
                     ),
+                ),
+                VGroup(
                     Item(
                         "surface_pressure_hpa",
                         label="Pressure (hPa)",
@@ -439,47 +457,68 @@ class SmartgPlayground(HasTraits):
                     ),
                 ),
                 label="Atmosphere",
-                show_border=True,
             ),
             VGroup(
-                HGroup(
+                VGroup(
                     Item("pointing_noise_enabled", label="Enable"),
                     Item("noise_preset", label="Preset"),
                     Item("noise_seed", label="Random seed"),
                     Item("new_run_button", show_label=False),
                 ),
-                HGroup(
+                VGroup(
                     Item("sigma_bias_deg", label="Static bias sigma (deg)"),
                     Item("sigma_acquisition_deg", label="Per-acquisition sigma (deg)"),
+                    enabled_when="pointing_noise_enabled",
+                ),
+                VGroup(
                     Item("sigma_drift_deg", label="Drift sigma (deg)"),
                     Item("drift_tau_s", label="Drift time constant (s)"),
                     enabled_when="pointing_noise_enabled",
                 ),
-                HGroup(
+                VGroup(
                     Item("sigma_jitter_deg", label="Jitter sigma (deg)"),
                     Item("yaw_factor", label="Yaw sigma factor"),
+                    enabled_when="pointing_noise_enabled",
+                ),
+                VGroup(
                     Item("acquisition_interval_s", label="Time between renders (s)"),
                     enabled_when="pointing_noise_enabled",
                 ),
-                Item("noise_budget_text", show_label=False, style="readonly"),
-                label="Pointing error",
-                show_border=True,
+                Item("noise_budget_text", show_label=False, style="readonly", width=-480),
+                label="Pointing",
             ),
-            HGroup(
-                Item("save_config_button", show_label=False),
-                Item("load_config_button", show_label=False),
+            VGroup(
+                HGroup(
+                    Item("save_config_button", show_label=False),
+                    Item("load_config_button", show_label=False),
+                ),
                 Item(
                     "headless_renders",
                     label="Renders in a headless run",
                     tooltip="Saved with the configuration; each render draws fresh pointing errors",
                 ),
-                label="Scenario file",
-                show_border=True,
+                label="Scenario",
             ),
-            Item("status_text", show_label=False, style="readonly"),
+          ),
+            # always visible, whichever tab is open
+            HGroup(
+                Item(
+                    "estimate_voxels_button",
+                    show_label=False,
+                    tooltip=(
+                        "Estimate how many voxels one pixel's footprint covers at the chosen "
+                        "resolution, and how many voxels neighbouring pixels share - without rendering"
+                    ),
+                ),
+                Item("render_button", show_label=False),
+            ),
+            Item("status_text", show_label=False, style="readonly", width=-480),
         ),
         resizable=True,
-        title="SMART-G Playground",
+        width=CONTROLS_WINDOW_WIDTH,
+        x=CONTROLS_WINDOW_POSITION[0],
+        y=CONTROLS_WINDOW_POSITION[1],
+        title="SMART-G Playground - settings",
     )
 
     def __init__(
@@ -967,7 +1006,11 @@ def run_playground(config_path: Path | None = None) -> None:
         config = PlaygroundConfig.load(config_path, require_dataset=False)
         simulation = PlaygroundSimulation.from_config(config)
     app = SmartgPlayground(simulation, config)
-    app.configure_traits()
+    # The scene window first (it only lives while the settings window does), then the
+    # settings window, which runs the GUI's event loop.
+    scene_ui = app.edit_traits(view="scene_view")
+    app.configure_traits(view="controls_view")
+    scene_ui.dispose()
 
 
 if __name__ == "__main__":
