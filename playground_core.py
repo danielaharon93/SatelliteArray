@@ -2196,9 +2196,21 @@ def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path, title: s
     top.set_ylabel("Solar irradiance (mW m$^{-2}$ nm$^{-1}$)")
     top.set_title("Extraterrestrial solar irradiance, mean per wavelength bin")
     top.legend(title="channel")
+    # what the probability would be if the wavelength were drawn in proportion to the irradiance over
+    # the whole range: the same shape within a channel, without the per-channel normalisation
+    bottom.plot(
+        wavelength, 100.0 * spectrum.solar / spectrum.solar.sum(), "k--o", ms=3, lw=1,
+        label="if drawn from the solar shape over the whole range",
+    )
+    bottom.legend(loc="upper left", fontsize=8)
     bottom.set_ylabel("Probability (%)")
     bottom.set_xlabel("Wavelength (nm)")
-    bottom.set_title("Probability that a photon gets each wavelength (response x irradiance x bin width)", fontsize=10)
+    bottom.set_title(
+        "Probability that a photon gets each wavelength: each channel gets 1/3 of the photons,\n"
+        "shared in proportion to response x irradiance x bin width",
+        fontsize=10,
+    )
+    bottom.set_ylim(0.0, 1.25 * float(spectrum.sampling.max()) * 100.0)  # room for the legend
     top.set_ylim(0.0, 1.35 * float(spectrum.solar.max()))  # room for the legend
     for axis in (top, bottom):
         axis.grid(alpha=0.3)
