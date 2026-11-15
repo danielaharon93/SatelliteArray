@@ -39,6 +39,11 @@ CHLOROPHYLL_MG_M3: list[float] | None = [0.1, 0.5, 1.0, 2.0, 5.0]
 BAND_SET: str | None = None
 CHANNEL: str | None = None
 
+# True: no atmosphere at all (no air molecules, gases or aerosol): the sea is lit by the sun
+# directly and seen without haze, a reference for how much the atmosphere changes the image.
+# None keeps the scenario file's own "no_atmosphere" setting.
+NO_ATMOSPHERE: bool | None = None
+
 # True: besides each image's reflectance (<name>.npy), also save its radiance in
 # W m-2 um-1 sr-1 (<name>_radiance.npy and .json), as run_bomex_headless.py does.
 SAVE_RADIANCE = True
@@ -67,12 +72,16 @@ def resolve(path: str) -> Path:
 def main() -> int:
     config_path = resolve(SCENARIO_CONFIG)
     try:
-        base = playground_core.PlaygroundConfig.load(config_path)
+        base = playground_core.PlaygroundConfig.load(config_path, require_dataset=False)
     except (OSError, ValueError) as exc:
         print(f"Could not load {config_path}: {exc}", file=sys.stderr)
         return 2
 
-    overrides = {name: value for name, value in (("band_set", BAND_SET), ("channel", CHANNEL)) if value is not None}
+    overrides = {
+        name: value
+        for name, value in (("band_set", BAND_SET), ("channel", CHANNEL), ("no_atmosphere", NO_ATMOSPHERE))
+        if value is not None
+    }
     values = list(CHLOROPHYLL_MG_M3 or [base.chlorophyll_mg_m3])
 
     playground_core.OUTPUT_DIR = resolve(OUTPUT_DIR)

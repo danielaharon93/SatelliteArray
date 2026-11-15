@@ -179,6 +179,7 @@ class SmartgPlayground(HasTraits):
     water_model = Enum(list(WATER_MODELS))
     sea_spectrum_file = Str(DEFAULT_SEA_SPECTRUM_FILE)
     matte_offset = Float(0.0)  # water_model "matte": 0 means the clear-sky table (config: None)
+    no_atmosphere = Bool(False)  # clear sky only: no air, gases or aerosol at all
     polarization = Bool(False)  # clear sky only: also save the Stokes parameters, DoLP, AoLP
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
@@ -424,6 +425,16 @@ class SmartgPlayground(HasTraits):
                 label="Cloud, sea",
             ),
             VGroup(
+                Item(
+                    "no_atmosphere",
+                    label="No atmosphere",
+                    enabled_when="cloud_source == 'none'",
+                    tooltip=(
+                        "Remove the atmosphere altogether (air molecules, gases, aerosol): the sun lights the "
+                        "surface directly and the sensor sees it with no haze or attenuation. Clear sky only: "
+                        "greyed out until Cloud (Cloud, sea tab) is set to none. The settings below are then ignored"
+                    ),
+                ),
                 VGroup(
                     Item(
                         "aerosol_model",
@@ -433,7 +444,7 @@ class SmartgPlayground(HasTraits):
                     Item(
                         "aod_550",
                         label="Optical depth (550 nm)",
-                        enabled_when="aerosol_model != 'none'",
+                        enabled_when="aerosol_model != 'none' and not (no_atmosphere and cloud_source == 'none')",
                         tooltip="Aerosol optical depth at 550 nm; about 0.05-0.15 over the clean ocean",
                     ),
                 ),
@@ -830,6 +841,7 @@ class SmartgPlayground(HasTraits):
             sea_spectrum_file=self.sea_spectrum_file,
             matte_offset=self.matte_offset or None,
             polarization=self.polarization and self.cloud_source == "none",
+            no_atmosphere=self.no_atmosphere and self.cloud_source == "none",
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
             acquisition_interval_s=self.acquisition_interval_s,
@@ -874,6 +886,7 @@ class SmartgPlayground(HasTraits):
         self.sea_spectrum_file = config.sea_spectrum_file
         self.matte_offset = config.matte_offset or 0.0
         self.polarization = config.polarization
+        self.no_atmosphere = config.no_atmosphere
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor
         self.acquisition_interval_s = config.acquisition_interval_s

@@ -483,6 +483,9 @@ class Environment:
     water_model: str = WATER_CHLOROPHYLL
     sea_spectrum_file: str = DEFAULT_SEA_SPECTRUM_FILE  # relative: to this file's folder
     matte_offset: float | None = None  # water_model "matte": the albedo offset, None = MATTE_OFFSET
+    # True: no atmosphere at all (no air molecules, gases or aerosol): the sun lights the surface
+    # directly and the sensor sees it without path radiance or attenuation. Clear sky only.
+    no_atmosphere: bool = False
 
 
 def build_atmosphere_1d(lat_deg: float, environment: Environment | None = None):
@@ -506,7 +509,8 @@ def build_atmosphere_1d(lat_deg: float, environment: Environment | None = None):
 
 def smartg_run_options(environment: Environment | None = None) -> dict:
     """Extra keyword arguments for Smartg.run() that the environment needs."""
-    if environment is not None and environment.aerosol_model != AEROSOL_NONE and environment.aod_550 > 0.0:
+    if (environment is not None and not environment.no_atmosphere
+            and environment.aerosol_model != AEROSOL_NONE and environment.aod_550 > 0.0):
         return {"n_icdf": AEROSOL_N_ICDF}
     return {}
 
@@ -976,7 +980,8 @@ def render_clear_sky(
     ds = Smartg().run(
         wavelength=spectrum.run_wavelength,
         wavelength_proba=spectrum.wavelength_proba,
-        atmosphere=build_atmosphere_1d(lat_deg, environment),
+        atmosphere=None if (environment is not None and environment.no_atmosphere)
+        else build_atmosphere_1d(lat_deg, environment),
         surface=sea,
         water=water,
         th_deg=sza_deg,
@@ -1213,6 +1218,9 @@ class PlaygroundConfig:
     # reflects), the same at every wavelength; None: MATTE_OFFSET, fitted for a clear sky.
     # About 0.02-0.03 suits an overcast sky (see theory/SMARTG_sea_model.pdf).
     matte_offset: float | None = None
+    # True: no atmosphere at all (see Environment.no_atmosphere); the aerosol, gas and pressure
+    # settings are then ignored. Clear sky only (cloud_source "none"), see validate().
+    no_atmosphere: bool = False
     # Also save the polarization (Stokes I, Q, U, V per channel, DoLP and AoLP): only for
     # the clear sky (cloud_source "none") so far, see validate().
     polarization: bool = False
@@ -1253,6 +1261,7 @@ class PlaygroundConfig:
             water_model=self.water_model,
             sea_spectrum_file=self.sea_spectrum_file,
             matte_offset=self.matte_offset,
+            no_atmosphere=self.no_atmosphere,
         )
 
     def noise_params(self) -> pointing_noise.PointingNoiseParams:
@@ -1308,6 +1317,8 @@ class PlaygroundConfig:
                 load_sea_spectrum(self.sea_spectrum_file)
             except (OSError, ValueError) as exc:
                 raise ValueError(f"sea_spectrum_file: {exc}") from exc
+        if self.no_atmosphere and self.cloud_source != CLOUD_NONE:
+            raise ValueError("no_atmosphere is only available for the clear sky (cloud_source 'none'): a cloud needs its atmosphere")
         if self.polarization and self.cloud_source != CLOUD_NONE:
             raise ValueError("polarization is only available for the clear sky (cloud_source 'none') so far")
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
@@ -1591,6 +1602,8 @@ class PlaygroundSimulation:
                 suffix += f"_{config.water_model}-{Path(config.sea_spectrum_file).stem}"
             elif config.water_body:
                 suffix += f"_chl{config.chlorophyll_mg_m3:g}"
+        if config.no_atmosphere:
+            return suffix + "_noatm"
         if config.aerosol_model != AEROSOL_NONE:
             suffix += f"_{config.aerosol_model}{config.aod_550:g}"
         if any(v is not None for v in (config.ozone_dobson, config.water_vapour_g_cm2, config.surface_pressure_hpa)):
