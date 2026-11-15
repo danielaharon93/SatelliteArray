@@ -175,6 +175,12 @@ failing file does not stop the others, and the exit code is 1 if any failed. The
 function is always SMART-G's Mie one. With `RENDER = False` it only builds the cloud
 files, which needs no GPU.
 
+With `SAVE_WAVELENGTH_DISTRIBUTION = True` (the default) each dataset's folder also gets
+`wavelength_distribution.pdf`: the probability with which SMART-G draws each photon's
+wavelength. For the grid band set it is response × solar irradiance × bin width (with the solar
+irradiance per bin in a panel above); for the `rgb` and `modis` band sets the draw is uniform
+among the few simulated wavelengths (1/3 each for three channels).
+
 With `SAVE_RADIANCE = True` (the default there) every image also gets its **radiance**
 next to the reflectance: `<name>_radiance.npy`, the same shape as `<name>.npy`, in
 W m⁻² µm⁻¹ sr⁻¹ (the unit of MODIS L1B radiances), and `<name>_radiance.json` with the
@@ -309,6 +315,18 @@ import numpy as np, main
 r = np.load("smartg_playground_images/<run>/satellite_04.npy")
 main.reflectance_to_image(r, gain=2.0, gamma=1.8).save("satellite_04_gain2.png")
 ```
+
+**Trying other processing on a raw result.** `python process_reflectance_gui.py [<name>.npy]`
+opens a window that loads a raw reflectance array and processes it as you set, without
+rendering again: reflectance or radiance (the sun's spectrum kept), channel gains and white
+balance (none, divide out the sun, gray world), normalisation, saturation, highlight
+roll-off, the tone curve (gamma, sRGB, linear) and a single-channel view. For a render with
+the grid band set it can also rebuild the channels from `<name>_spectral.npz` with another
+camera response (overlapping Gaussian filters, or a CSV of nm, blue, green, red). Radiance
+needs `<name>_radiance.json` (written by `run_bomex_headless.py`) or the `_spectral.npz`
+next to the file. Under the image it plots reflectance (or spectral radiance) against wavelength
+for the pixel you click (outlined on the image). It saves the displayed PNG, the linear data (`.npy`, blue, green, red) and
+the settings used (`.json`). It needs no GPU and no SMART-G.
 
 The `_noise_seed…_render…` suffix is added when the pointing error is on, so renders of
 a run don't overwrite each other. The status text / printed log gives each satellite's

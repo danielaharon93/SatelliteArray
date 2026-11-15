@@ -65,6 +65,12 @@ RENDER = True
 # channel's mean solar irradiance times cos(sun zenith) / pi.
 SAVE_RADIANCE = True
 
+# True: also save, in each dataset's output folder, wavelength_distribution.pdf: the
+# probability with which SMART-G draws each photon's wavelength (for the grid band set the
+# solar irradiance behind it too; for the rgb and modis band sets a uniform draw among the
+# few simulated wavelengths).
+SAVE_WAVELENGTH_DISTRIBUTION = True
+
 # Where things are written: the cloud files (one per dataset and setting, reused
 # on later runs), and the images (one subfolder per dataset).
 GENERATED_CLOUD_DIR = "generated_clouds"
@@ -158,6 +164,12 @@ def main() -> int:
                 playground_core.OUTPUT_DIR = output_root / path.name.split(".")[0]
                 playground_core.run_config(config)
                 print(f"Images in {playground_core.OUTPUT_DIR}")
+                if SAVE_WAVELENGTH_DISTRIBUTION:
+                    pdf = playground_core.OUTPUT_DIR / "wavelength_distribution.pdf"
+                    playground_core.save_wavelength_distribution_figure(
+                        playground_core.config_spectrum(config), pdf, title=f"{config.band_set} band set"
+                    )
+                    print(f"Wavelength distribution: {pdf}")
             else:
                 cloud_file = playground_core.bomex_cloud_file(
                     path, EXTINCTION_METHOD, CROP_CELLS, on_status=print

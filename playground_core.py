@@ -229,6 +229,9 @@ class Spectrum:
     # reflectance is relative to: the response-weighted mean over the channel. With the
     # reflectance it gives the channel's radiance, see radiance_from_reflectance().
     channel_irradiance: np.ndarray | None = None
+    # MODIS band set only: the representative wavelength (nm) of each REPTRAN internal band
+    # (`run_wavelength` is then a BandSet, which does not give them directly).
+    representative_nm: np.ndarray | None = None
 
     @property
     def n_channels(self) -> int:
@@ -340,7 +343,14 @@ def make_spectrum(
     for name in wanted:
         band = reptran.band(by_name[MODIS_CHANNELS[name]])
         labels.append(f"MODIS {MODIS_CHANNELS[name][-3:]} ({band.wmin:.0f}-{band.wmax:.0f} nm)")
-    return Spectrum(tuple(labels), BandSet(internal), group, weight, channel_irradiance=irradiance)
+    return Spectrum(
+        tuple(labels),
+        BandSet(internal),
+        group,
+        weight,
+        channel_irradiance=irradiance,
+        representative_nm=np.array([float(i.w) for i in internal]),
+    )
 
 
 def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_nm: float) -> Spectrum:
@@ -1609,7 +1619,8 @@ class PlaygroundSimulation:
         n_wavelengths) for the clear sky, whose image is uniform),
         `wavelength_nm`, `sampling_probability` (the share of the photons each
         wavelength got), `channel_weight` and `channel_of_wavelength` (how the
-        channels were combined) and `channel_labels`. A wavelength that got few
+        channels were combined), `channel_labels`, and `solar_irradiance_mW_m2_nm` and
+        `bin_width_nm` (the sun and the width of each wavelength's bin). A wavelength that got few
         photons is noisy; only the weighted sums over a channel are smooth."""
         if config.band_set != BAND_SET_GRID or cube is None:
             return
@@ -1622,6 +1633,8 @@ class PlaygroundSimulation:
             channel_weight=spectrum.weight,
             channel_of_wavelength=spectrum.group,
             channel_labels=np.array(spectrum.labels),
+            solar_irradiance_mW_m2_nm=spectrum.solar,
+            bin_width_nm=spectrum.bin_width,
         )
         save_wavelength_distribution_figure(
             spectrum, png_path.with_name(f"{png_path.stem}_wavelength_distribution.svg")
@@ -2125,17 +2138,53 @@ def save_polarization_figure(stokes: np.ndarray, path: Path, title: str, labels:
     figure.savefig(path, dpi=110)
 
 
-def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path) -> None:
-    """Save, as a vector graphic (SVG), the wavelength distribution of the "grid"
-    band set: the solar irradiance in each wavelength bin (top) and the share of
-    the photons that SMART-G draws at each wavelength (bottom), with the bars
-    coloured by channel. Uses matplotlib's Agg canvas directly, so it needs no
-    display."""
+def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path, title: str = "") -> None:
+    """Save a figure of the probability that a photon is given each simulated wavelength, the
+    distribution SMART-G draws the wavelength from. The format is the file's extension (".svg", a
+    vector graphic, or ".pdf"). Uses matplotlib's Agg canvas directly, so it needs no display.
+
+    "grid" band set: two panels, the solar irradiance in each wavelength bin (top) and the
+    share of the photons that each wavelength gets (bottom, response x irradiance x bin
+    width), the bars coloured by channel. Other band sets: SMART-G draws uniformly among the
+    simulated wavelengths (the three of "rgb", the REPTRAN representative wavelengths of the
+    MODIS channels), so one panel with each wavelength's probability."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    wavelength = np.asarray(spectrum.run_wavelength, float)
     colours = ("tab:blue", "tab:green", "tab:red")
+    file_format = Path(path).suffix.lstrip(".").lower() or "svg"
+    if spectrum.sampling is None:
+        wavelength = (
+            spectrum.representative_nm
+            if spectrum.representative_nm is not None
+            else np.asarray(spectrum.run_wavelength, float)
+        )
+        group = spectrum.group if spectrum.group is not None else np.arange(len(wavelength))
+        share = 100.0 / len(wavelength)
+        figure = Figure(figsize=(8.0, 4.2), layout="constrained")
+        FigureCanvasAgg(figure)
+        axis = figure.subplots()
+        for channel, label in enumerate(spectrum.labels):
+            colour = colours[channel] if spectrum.n_channels == 3 else "tab:gray"
+            for value in wavelength[group == channel]:
+                axis.bar(value, share, width=6.0, color=colour, alpha=0.85, label=label if value == wavelength[group == channel][0] else None)
+                axis.annotate(f"{share:.1f} %\n{value:.0f} nm", (value, share), ha="center", va="bottom", fontsize=9)
+        axis.set_ylim(0.0, 1.7 * share)  # room for the legend above the bars
+        axis.set_xlim(wavelength.min() - 60.0, wavelength.max() + 60.0)
+        axis.set_xlabel("Wavelength (nm)")
+        axis.set_ylabel("Probability that a photon gets the wavelength (%)")
+        axis.set_title(
+            f"Uniform draw among the {len(wavelength)} simulated wavelengths (SMART-G's default: no wavelength_proba)",
+            fontsize=10,
+        )
+        axis.legend(title="channel", loc="upper center", ncol=max(1, spectrum.n_channels))
+        axis.grid(alpha=0.3)
+        if title:
+            figure.suptitle(title)
+        figure.savefig(path, format=file_format)
+        return
+
+    wavelength = np.asarray(spectrum.run_wavelength, float)
     figure = Figure(figsize=(8.0, 6.0), layout="constrained")
     FigureCanvasAgg(figure)
     top, bottom = figure.subplots(2, 1, sharex=True)
@@ -2147,13 +2196,15 @@ def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path) -> None:
     top.set_ylabel("Solar irradiance (mW m$^{-2}$ nm$^{-1}$)")
     top.set_title("Extraterrestrial solar irradiance, mean per wavelength bin")
     top.legend(title="channel")
-    bottom.set_ylabel("Share of photons (%)")
+    bottom.set_ylabel("Probability (%)")
     bottom.set_xlabel("Wavelength (nm)")
-    bottom.set_title("Photon wavelength distribution (response x irradiance x bin width)")
+    bottom.set_title("Probability that a photon gets each wavelength (response x irradiance x bin width)", fontsize=10)
     top.set_ylim(0.0, 1.35 * float(spectrum.solar.max()))  # room for the legend
     for axis in (top, bottom):
         axis.grid(alpha=0.3)
-    figure.savefig(path, format="svg")
+    if title:
+        figure.suptitle(title)
+    figure.savefig(path, format=file_format)
 
 
 def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> None:
