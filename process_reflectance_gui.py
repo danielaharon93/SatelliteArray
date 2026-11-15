@@ -451,7 +451,7 @@ def spectrum_plot_data(
         else:
             continue
         bars.append((float(low), float(high), float(values[k]), names[k], colours[k]))
-    ylabel = "Spectral radiance (W m-2 um-1 sr-1)" if radiance else "Reflectance"
+    ylabel = "Spectral radiance\n(W m-2 um-1 sr-1)" if radiance else "Reflectance"
     return SpectrumData(lam, vals, response, bars, ylabel, where)
 
 
@@ -590,8 +590,9 @@ def run_window(initial: str | None = None, run: bool = True):
             scroll = QtWidgets.QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setWidget(controls)
-            scroll.setMinimumWidth(430)
-            scroll.setMaximumWidth(520)
+            natural = controls.sizeHint().width()  # the controls' own width, so nothing is clipped
+            scroll.setMinimumWidth(natural + 40)  # room for the scroll bar and the frame
+            scroll.setMaximumWidth(natural + 100)
 
             self.figure = Figure(figsize=(6, 3), layout=None)
             self.canvas = FigureCanvasQTAgg(self.figure)
@@ -870,7 +871,7 @@ def run_window(initial: str | None = None, run: bool = True):
                 return
             self.loaded = loaded
             self._cache_key = None
-            parts = [f"{loaded.path.name}: {loaded.reflectance.shape[1]} x {loaded.reflectance.shape[0]} pixels, "
+            parts = [f"{loaded.path.name.replace('_', '_' + chr(0x200b))}: {loaded.reflectance.shape[1]} x {loaded.reflectance.shape[0]} pixels, "
                      f"{loaded.reflectance.shape[2]} channel(s)."]
             parts.append("Sun zenith " + (f"{loaded.sza_deg:g} deg." if loaded.sza_deg is not None else "unknown."))
             parts.append(
