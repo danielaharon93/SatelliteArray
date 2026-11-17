@@ -60,7 +60,13 @@ CHANNEL_NAMES = ("blue", "green", "red")  # the order of the arrays' last axis
 LUMINANCE_BGR = np.array([0.0722, 0.7152, 0.2126])  # Rec. 709, in the arrays' B, G, R order
 
 QUANTITIES = ("reflectance", "radiance")
-SPECTRAL_CHOICES = ("saved", "gaussian", "csv")
+SPECTRAL_CHOICES = ("saved", "gaussian", "csv", "modis_terra", "modis_aqua")
+# The measured MODIS relative spectral responses of bands 3, 4 and 1 (blue, green, red), detector-averaged,
+# from NASA's MODIS Characterization Support Team (see configs/modis_rsr/README.md).
+MODIS_RESPONSE_FILES = {
+    "modis_terra": Path(__file__).with_name("configs") / "modis_rsr" / "modis_terra_rsr_b03_b04_b01.csv",
+    "modis_aqua": Path(__file__).with_name("configs") / "modis_rsr" / "modis_aqua_rsr_b03_b04_b01.csv",
+}
 WHITE_BALANCES = ("none", "sun", "gray")
 NORMALISATIONS = ("none", "percentile")
 HIGHLIGHTS = ("clip", "rolloff")
@@ -274,10 +280,14 @@ def response_matrix(loaded: Loaded, s: Settings) -> np.ndarray:
         if (fwhm <= 0).any():
             raise ValueError("the filter widths must be positive")
         return np.exp(-4.0 * np.log(2.0) * ((lam[:, None] - centre) / fwhm) ** 2)
-    if s.spectral == "csv":
-        if not s.response_csv:
+    if s.spectral == "csv" or s.spectral in MODIS_RESPONSE_FILES:
+        if s.spectral in MODIS_RESPONSE_FILES:
+            csv_file = MODIS_RESPONSE_FILES[s.spectral]
+        elif not s.response_csv:
             raise ValueError("choose a response file")
-        nm, columns = load_response_csv(s.response_csv)
+        else:
+            csv_file = s.response_csv
+        nm, columns = load_response_csv(csv_file)
         return np.stack([np.interp(lam, nm, columns[:, k], left=0.0, right=0.0) for k in range(3)], axis=1)
     raise ValueError(f"no response for {s.spectral!r}")
 
@@ -539,6 +549,7 @@ class SpectrumData:
     ylabel: str
     where: str
     ylim: tuple | None = None
+    bin_width_nm: np.ndarray | None = None  # the width of each wavelength's bin, to draw the response as blocks
 
 
 def _pick(loaded: Loaded, pixel: tuple[int, int] | None):
@@ -630,7 +641,7 @@ def _spectrum_layout(loaded, s, n_bars, values, lam, vals, ylabel, where) -> Spe
         else:
             continue
         bars.append((float(low), float(high), float(values[k]), names[k], colours[k]))
-    return SpectrumData(lam, vals, response, bars, ylabel, where)
+    return SpectrumData(lam, vals, response, bars, ylabel, where, bin_width_nm=loaded.bin_width_nm)
 
 
 def draw_spectrum(figure, data: SpectrumData) -> None:
@@ -642,7 +653,11 @@ def draw_spectrum(figure, data: SpectrumData) -> None:
             ax2 = ax.twinx()
             for k in range(data.response.shape[1]):
                 colour = CHANNEL_COLOURS[k] if data.response.shape[1] == 3 else "black"
-                ax2.fill_between(data.wavelength_nm, data.response[:, k] / data.response.max(), color=colour, alpha=0.12, lw=0)
+                height = data.response[:, k] / data.response.max()
+                if data.bin_width_nm is not None:  # one flat block per bin, with its true edges
+                    ax2.bar(data.wavelength_nm, height, width=data.bin_width_nm, color=colour, alpha=0.12, lw=0)
+                else:
+                    ax2.fill_between(data.wavelength_nm, height, color=colour, alpha=0.12, lw=0)
             ax2.set_ylim(0, 3.0)  # the response fills the lower third
             ax2.set_yticks([])
             ax2.set_zorder(0)
@@ -858,6 +873,8 @@ def run_window(initial: str | None = None, run: bool = True):
                     ("saved", "As simulated"),
                     ("gaussian", "Gaussian filters (needs the wavelengths)"),
                     ("csv", "Response file (needs the wavelengths)"),
+                    ("modis_terra", "MODIS Terra response, b03 b04 b01 (needs the wavelengths)"),
+                    ("modis_aqua", "MODIS Aqua response, b03 b04 b01 (needs the wavelengths)"),
                 ],
                 "The wavelength options rebuild the channels from <name>_spectral.npz (grid band set only)",
             )
