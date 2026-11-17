@@ -170,7 +170,13 @@ BAND_SET_MODIS = "modis"
 # over its wavelengths (see make_spectrum()). The range is split into equal
 # thirds for the blue, green and red channels.
 BAND_SET_GRID = "grid"
-BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS, BAND_SET_GRID)
+# The three MODIS bands (b03, b04, b01), each simulated in its own SMART-G run on a grid of
+# wavelengths covering that band only (see _grid_modis_spectrum()): a run's photons are only ever
+# given wavelengths inside its band, and the channel is the response x solar irradiance weighted mean.
+BAND_SET_GRID_MODIS = "grid_modis"
+BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS, BAND_SET_GRID, BAND_SET_GRID_MODIS)
+# The band sets with a wavelength grid: the per-wavelength reflectance (and Stokes parameters) are saved.
+SPECTRAL_BAND_SETS = (BAND_SET_GRID, BAND_SET_GRID_MODIS)
 GRID_DEFAULT_RANGE_NM = (400.0, 700.0)
 GRID_DEFAULT_STEP_NM = 10.0
 GRID_MIN_NM, GRID_MAX_NM = 300.0, 4000.0  # inside the water-cloud table's 253-4441 nm
@@ -232,6 +238,15 @@ class Spectrum:
     # MODIS band set only: the representative wavelength (nm) of each REPTRAN internal band
     # (`run_wavelength` is then a BandSet, which does not give them directly).
     representative_nm: np.ndarray | None = None
+    # "grid_modis" band set only: the Spectrum of each SMART-G run (one per MODIS band, each with
+    # its own wavelengths and wavelength_proba). The fields above then describe all the runs
+    # together: the wavelengths one after another, `sampling` the share of ALL the photons.
+    parts: tuple | None = None
+
+    @property
+    def runs(self) -> tuple:
+        """What each SMART-G run simulates: the parts, or this Spectrum alone."""
+        return self.parts if self.parts else (self,)
 
     @property
     def n_channels(self) -> int:
@@ -306,9 +321,9 @@ def make_spectrum(
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
 ) -> Spectrum:
-    """The Spectrum for a `band_set` ("rgb", "modis" or "grid") and a `channel`
-    ("all", or one of "blue", "green", "red"). `grid_range_nm` and `grid_step_nm`
-    only matter for the "grid" band set; pass the range as a tuple."""
+    """The Spectrum for a `band_set` ("rgb", "modis", "grid" or "grid_modis") and a `channel`
+    ("all", or one of "blue", "green", "red"). `grid_range_nm` only matters for the "grid" band
+    set (pass it as a tuple); `grid_step_nm` for "grid" and "grid_modis"."""
     if channel not in CHANNELS:
         raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
     if band_set == BAND_SET_RGB:
@@ -318,6 +333,8 @@ def make_spectrum(
         )
     if band_set == BAND_SET_GRID:
         return _grid_spectrum(channel, tuple(grid_range_nm), float(grid_step_nm))
+    if band_set == BAND_SET_GRID_MODIS:
+        return _grid_modis_spectrum(channel, float(grid_step_nm))
     if band_set != BAND_SET_MODIS:
         raise ValueError(f"band_set must be one of {BAND_SETS}, not {band_set!r}")
 
@@ -403,6 +420,64 @@ def _grid_spectrum(channel: str, grid_range_nm: tuple[float, float], grid_step_n
         np.array(width),
         reff_acc=GRID_REFF_ACC,
         channel_irradiance=irradiance,
+    )
+
+
+def _grid_modis_spectrum(channel: str, grid_step_nm: float) -> Spectrum:
+    """The "grid_modis" band set: one SMART-G run per MODIS band (b03 blue, b04 green, b01 red).
+    A run simulates only the wavelengths inside its band (the band limits stored in SMART-G's
+    MODIS REPTRAN file), in bins of about `grid_step_nm`, and draws each photon's wavelength with
+    probability proportional to the solar irradiance x bin width (the response is 1 inside the
+    band): no wavelength has probability zero, so SMART-G's sampling table stays small. The
+    channel is the weighted mean sum(w x reflectance) / sum(w) over its band, w = irradiance x
+    bin width, as in the "grid" band set. Each run gets an equal share of the photons."""
+    import re
+
+    from smartg.cdf import icdf
+    from smartg.reptran import Reptran
+
+    wanted = [name for name in CHANNEL_BAND if channel in (CHANNEL_ALL, name)]  # blue, green, red
+    reptran = Reptran(MODIS_REPTRAN_FILE)
+    matches = [(re.search(r"modis_(?:terra|aqua)_b\d\d", str(n)), i) for i, n in enumerate(reptran.band_names)]
+    by_name = {m.group(0): i for m, i in matches if m is not None}
+    parts = []
+    for name in wanted:
+        band = reptran.band(by_name[MODIS_CHANNELS[name]])
+        low, high = float(band.wmin), float(band.wmax)
+        n_bins = max(1, int(round((high - low) / grid_step_nm)))
+        edges = np.linspace(low, high, n_bins + 1)
+        mid = 0.5 * (edges[:-1] + edges[1:])
+        width = np.diff(edges)
+        irradiance = solar_irradiance_bins(tuple(float(e) for e in edges))
+        weight = irradiance * width
+        share = weight / weight.sum()
+        parts.append(
+            Spectrum(
+                (f"MODIS {MODIS_CHANNELS[name][-3:]} ({low:.0f}-{high:.0f} nm), grid",),
+                mid,
+                np.zeros(n_bins, dtype=int),
+                weight,
+                icdf(share).astype(np.int64) if n_bins > 1 else None,  # one wavelength: nothing to draw from
+                share,
+                irradiance,
+                width,
+                reff_acc=GRID_REFF_ACC,
+                channel_irradiance=np.array([weight.sum() / width.sum()]),
+            )
+        )
+    n_runs = len(parts)
+    return Spectrum(
+        tuple(part.labels[0] for part in parts),
+        np.concatenate([part.run_wavelength for part in parts]),
+        np.concatenate([np.full(len(part.run_wavelength), k) for k, part in enumerate(parts)]),
+        np.concatenate([part.weight for part in parts]),
+        None,  # each part has its own wavelength_proba
+        np.concatenate([part.sampling for part in parts]) / n_runs,  # the share of all the photons
+        np.concatenate([part.solar for part in parts]),
+        np.concatenate([part.bin_width for part in parts]),
+        reff_acc=GRID_REFF_ACC,
+        channel_irradiance=np.concatenate([part.channel_irradiance for part in parts]),
+        parts=tuple(parts),
     )
 
 
@@ -823,6 +898,34 @@ def pointing_offset(
     return float(np.dot(delta, east)), float(np.dot(delta, north))
 
 
+def _run_parts(spectrum: Spectrum, n_photons: float, run) -> list:
+    """Call `run(part, photons, index)` once for each SMART-G run of `spectrum` (one, except for the
+    "grid_modis" band set, which has one per MODIS band) and return the results in order. With several
+    runs each gets an equal share of `n_photons`, so the total is what it would be in a single run."""
+    parts = spectrum.runs
+    photons = n_photons if len(parts) == 1 else n_photons / len(parts)
+    return [run(part, photons, index) for index, part in enumerate(parts)]
+
+
+def _clear_sky_toa(ds, name: str) -> np.ndarray:
+    """(views, wavelengths) of one TOA variable of a clear-sky run. SMART-G drops the wavelength
+    axis when a run has a single wavelength, which then counts as one column."""
+    values = ds[name]
+    if "wavelength" in values.dims:
+        values = values.transpose("Zenith angles", "wavelength")
+    return np.asarray(values.values).reshape(values.sizes["Zenith angles"], -1)
+
+
+def _toa_3d(datasets: list) -> np.ndarray:
+    """(n_sensors, n_wavelengths): the TOA reflectance of the 3D runs' datasets, the wavelengths of
+    each run after those of the one before."""
+    arrays = []
+    for ds in datasets:
+        values = np.asarray(ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0}).values)
+        arrays.append(values.reshape(len(values), -1))
+    return np.concatenate(arrays, axis=1)
+
+
 def render_view(
     satellite_position_km: np.ndarray,
     point_a_km: np.ndarray,
@@ -884,7 +987,7 @@ def render_view(
     wavelength_nm, atmosphere, surface, grid_3d, water = build_scene_3d(
         lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum, environment
     )
-    atmosphere_profile = atmosphere.calc(wavelength_nm)
+    atmosphere_profiles = [atmosphere.calc(part.run_wavelength) for part in spectrum.runs]
 
     pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
 
@@ -911,22 +1014,26 @@ def render_view(
         count_level=np.array([0]),  # 0 = UPTOA, see smartg.sensor.Sensor
     )
 
-    ds = Smartg(back=True, opt3d=True).run(
-        wavelength=wavelength_nm,
-        wavelength_proba=spectrum.wavelength_proba,
-        atmosphere=atmosphere_profile,
-        surface=surface,
-        water=water,
-        sensor=sensors,
-        le=le,
-        n_photons=n_photons,
-        progress=False,
-        **smartg_run_options(environment),
-    )
-    toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
-    reflectance = spectrum.channels(toa_reflectance.values).reshape(height_px, width_px, spectrum.n_channels)
+    sg = Smartg(back=True, opt3d=True)
+
+    def run(part, photons, index):
+        return sg.run(
+            wavelength=part.run_wavelength,
+            wavelength_proba=part.wavelength_proba,
+            atmosphere=atmosphere_profiles[index],
+            surface=surface,
+            water=water,
+            sensor=sensors,
+            le=le,
+            n_photons=photons,
+            progress=False,
+            **smartg_run_options(environment),
+        )
+
+    toa = _toa_3d(_run_parts(spectrum, n_photons, run))  # (pixels, wavelengths)
+    reflectance = spectrum.channels(toa).reshape(height_px, width_px, spectrum.n_channels)
     if spectral_out is not None:
-        spectral_out["single"] = np.asarray(toa_reflectance.values).reshape(height_px, width_px, -1)
+        spectral_out["single"] = toa.reshape(height_px, width_px, -1)
     return reflectance, vza_deg, vaa_deg
 
 
@@ -977,30 +1084,42 @@ def render_clear_sky(
     # The sun direction goes to the run, the viewing directions to the local estimate;
     # both in the frame of viewing_angles_deg(), where the sun glint is at the sun's
     # azimuth + 180 deg.
-    ds = Smartg().run(
-        wavelength=spectrum.run_wavelength,
-        wavelength_proba=spectrum.wavelength_proba,
-        atmosphere=None if (environment is not None and environment.no_atmosphere)
-        else build_atmosphere_1d(lat_deg, environment),
-        surface=sea,
-        water=water,
-        th_deg=sza_deg,
-        ph_deg=saa_deg,
-        le=LocalEstimate(
-            th_deg=np.array([vza for vza, _ in angles]),
-            phi_deg=np.array([vaa for _, vaa in angles]),
-            zip=True,
-        ),
-        n_photons=n_photons,
-        progress=False,
+    atmosphere = (
+        None if (environment is not None and environment.no_atmosphere) else build_atmosphere_1d(lat_deg, environment)
     )
-    toa = ds["I_up (TOA)"].transpose("Zenith angles", "wavelength").values  # (views, wavelengths)
+
+    def run(part, photons, index):
+        return Smartg().run(
+            wavelength=part.run_wavelength,
+            wavelength_proba=part.wavelength_proba,
+            atmosphere=atmosphere,
+            surface=sea,
+            water=water,
+            th_deg=sza_deg,
+            ph_deg=saa_deg,
+            le=LocalEstimate(
+                th_deg=np.array([vza for vza, _ in angles]),
+                phi_deg=np.array([vaa for _, vaa in angles]),
+                zip=True,
+            ),
+            n_photons=photons,
+            progress=False,
+        )
+
+    datasets = _run_parts(spectrum, n_photons, run)  # one run, or one per MODIS band ("grid_modis")
+    toa = np.concatenate(
+        [_clear_sky_toa(ds, "I_up (TOA)") for ds in datasets], axis=1
+    )  # (views, wavelengths), the wavelengths of each run after those of the one before
     channels = spectrum.channels(toa)
     if stokes_out is not None:
         # I, Q, U, V come out of the same run; the channel weights are linear, so they
         # apply to each Stokes parameter alike (DoLP and AoLP follow from the channel values).
-        stokes_toa = np.stack(
-            [ds[f"{name}_up (TOA)"].transpose("Zenith angles", "wavelength").values for name in "IQUV"]
+        stokes_toa = np.concatenate(
+            [
+                np.stack([_clear_sky_toa(ds, f"{name}_up (TOA)") for name in "IQUV"])
+                for ds in datasets
+            ],
+            axis=2,
         )  # (4, views, wavelengths)
         stokes_channels = np.stack([spectrum.channels(component) for component in stokes_toa])  # (4, views, channels)
     results = []
@@ -1096,7 +1215,7 @@ def render_formation_frozen(
     wavelength_nm, atmosphere, surface, grid_3d, water = build_scene_3d(
         lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum, environment
     )
-    atmosphere_profile = atmosphere.calc(wavelength_nm)
+    atmosphere_profiles = [atmosphere.calc(part.run_wavelength) for part in spectrum.runs]
 
     pos_z = grid_3d.zGRID[-1] - main.SMARTG_3D_SENSOR_TOP_OFFSET_KM
 
@@ -1128,24 +1247,24 @@ def render_formation_frozen(
             rotation_rad=rotation_rad,
             target_height_km=cloud.center_height_km,
         )
-        ds = sg.run(
-            wavelength=wavelength_nm,
-            wavelength_proba=spectrum.wavelength_proba,
-            atmosphere=atmosphere_profile,
-            surface=surface,
-            water=water,
-            sensor=sensors,
-            le=le,
-            n_photons=n_photons,
-            progress=False,
-            **smartg_run_options(environment),
-        )
-        toa_reflectance = ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0})
-        images[index] = spectrum.channels(toa_reflectance.values).reshape(
-            height_px, width_px, spectrum.n_channels
-        )
+        def run(part, photons, part_index, sensors=sensors):
+            return sg.run(
+                wavelength=part.run_wavelength,
+                wavelength_proba=part.wavelength_proba,
+                atmosphere=atmosphere_profiles[part_index],
+                surface=surface,
+                water=water,
+                sensor=sensors,
+                le=le,
+                n_photons=photons,
+                progress=False,
+                **smartg_run_options(environment),
+            )
+
+        toa = _toa_3d(_run_parts(spectrum, n_photons, run))  # (pixels, wavelengths)
+        images[index] = spectrum.channels(toa).reshape(height_px, width_px, spectrum.n_channels)
         if spectral_out is not None:
-            spectral_out[index] = np.asarray(toa_reflectance.values).reshape(height_px, width_px, -1)
+            spectral_out[index] = toa.reshape(height_px, width_px, -1)
 
     return images
 
@@ -1635,7 +1754,7 @@ class PlaygroundSimulation:
         channels were combined), `channel_labels`, and `solar_irradiance_mW_m2_nm` and
         `bin_width_nm` (the sun and the width of each wavelength's bin). A wavelength that got few
         photons is noisy; only the weighted sums over a channel are smooth."""
-        if config.band_set != BAND_SET_GRID or cube is None:
+        if config.band_set not in SPECTRAL_BAND_SETS or cube is None:
             return
         spectrum = config_spectrum(config)
         np.savez_compressed(
@@ -1688,7 +1807,7 @@ class PlaygroundSimulation:
         np.save(png_path.with_name(f"{png_path.stem}_stokes.npy"), cube)
         labels = config_spectrum(config).labels
         save_polarization_figure(cube, png_path.with_name(f"{png_path.stem}_polarization.png"), png_path.stem, labels)
-        if config.band_set == BAND_SET_GRID:
+        if config.band_set in SPECTRAL_BAND_SETS:
             np.savez_compressed(
                 png_path.with_name(f"{png_path.stem}_stokes_spectral.npz"),
                 stokes=stokes["spectral"].astype(np.float32),
@@ -2209,20 +2328,26 @@ def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path, title: s
     top.set_ylabel("Solar irradiance (mW m$^{-2}$ nm$^{-1}$)")
     top.set_title("Extraterrestrial solar irradiance, mean per wavelength bin")
     top.legend(title="channel")
-    # what the probability would be if the wavelength were drawn in proportion to the irradiance over
-    # the whole range: the same shape within a channel, without the per-channel normalisation
-    bottom.plot(
-        wavelength, 100.0 * spectrum.solar / spectrum.solar.sum(), "k--o", ms=3, lw=1,
-        label="if drawn from the solar shape over the whole range",
-    )
-    bottom.legend(loc="upper left", fontsize=8)
+    if spectrum.parts is None:
+        # what the probability would be if the wavelength were drawn in proportion to the irradiance over
+        # the whole range: the same shape within a channel, without the per-channel normalisation
+        bottom.plot(
+            wavelength, 100.0 * spectrum.solar / spectrum.solar.sum(), "k--o", ms=3, lw=1,
+            label="if drawn from the solar shape over the whole range",
+        )
+        bottom.legend(loc="upper left", fontsize=8)
+        bottom_title = (
+            "Probability that a photon gets each wavelength: each channel gets 1/3 of the photons,\n"
+            "shared in proportion to response x irradiance x bin width"
+        )
+    else:
+        bottom_title = (
+            f"Probability that a photon gets each wavelength: {len(spectrum.parts)} SMART-G runs, one per band,\n"
+            "each with 1/3 of the photons, shared in proportion to irradiance x bin width"
+        )
     bottom.set_ylabel("Probability (%)")
     bottom.set_xlabel("Wavelength (nm)")
-    bottom.set_title(
-        "Probability that a photon gets each wavelength: each channel gets 1/3 of the photons,\n"
-        "shared in proportion to response x irradiance x bin width",
-        fontsize=10,
-    )
+    bottom.set_title(bottom_title, fontsize=10)
     bottom.set_ylim(0.0, 1.25 * float(spectrum.sampling.max()) * 100.0)  # room for the legend
     top.set_ylim(0.0, 1.35 * float(spectrum.solar.max()))  # room for the legend
     for axis in (top, bottom):
@@ -2249,6 +2374,10 @@ def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> 
     if config.band_set == BAND_SET_GRID:
         log(f"Grid: {len(spectrum.run_wavelength)} wavelengths between {config.grid_range_nm[0]:g} and "
             f"{config.grid_range_nm[1]:g} nm, photons drawn in proportion to response x solar irradiance")
+    if config.band_set == BAND_SET_GRID_MODIS:
+        counts = ", ".join(f"{len(part.run_wavelength)} in {part.labels[0]}" for part in spectrum.runs)
+        log(f"{len(spectrum.runs)} SMART-G run(s), one per MODIS band, each with an equal share of the photons "
+            f"(step about {config.grid_step_nm:g} nm: {counts}); photons drawn in proportion to solar irradiance x bin width")
     renders = config.renders
     if renders > 1 and not config.pointing_noise_enabled:
         log("Pointing error is off, so repeated renders would be identical: doing 1.")

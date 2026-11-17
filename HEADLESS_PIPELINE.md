@@ -109,9 +109,9 @@ JSON, written by the GUI. Every setting of the scenario plus the geometry moment
 | `resolution` | `"Tiny (16x16)"`, `"Small (32x32)"` or `"Medium (64x64)"`. |
 | `photons_per_pixel` | Photons per pixel; total sent to SMART-G = this × pixel count. |
 | `channel` | Which wavelengths to simulate: `"all"` (default: blue, green and red, 440 / 550 / 670 nm) or one of `"blue"`, `"green"`, `"red"` (a single wavelength: the `.npy` has shape `(height, width, 1)` and the PNG is grayscale). Set it in the GUI with "Color channel", or override it for one headless run with `CHANNEL` in `run_from_config.py`. |
-| `band_set` | What a channel is: `"rgb"` (default: single wavelengths, 440 / 550 / 670 nm), `"modis"` (the MODIS Terra channels b03, b04 and b01, simulated as SMART-G REPTRAN bands) or `"grid"` (a grid of wavelengths over a camera's range, with the photons' wavelengths drawn in proportion to response x solar irradiance), see [Band sets](#band-sets). Set it in the GUI with "Band set", or override it for one headless run with `BAND_SET` in `run_from_config.py`. |
+| `band_set` | What a channel is: `"rgb"` (default: single wavelengths, 440 / 550 / 670 nm), `"modis"` (the MODIS Terra channels b03, b04 and b01, simulated as SMART-G REPTRAN bands) `"grid"` (a grid of wavelengths over a camera's range, with the photons' wavelengths drawn in proportion to response x solar irradiance) or `"grid_modis"` (the three MODIS bands, each simulated in its own SMART-G run on a grid of wavelengths inside that band), see [Band sets](#band-sets). Set it in the GUI with "Band set", or override it for one headless run with `BAND_SET` in `run_from_config.py`. |
 | `grid_range_nm` | `"grid"` only: `[low, high]`, the camera's range in nm (default `[400, 700]`, allowed 300-4000), split into equal thirds for the blue, green and red channels. |
-| `grid_step_nm` | `"grid"` only: width of the wavelength bins in nm (default 10; at most a third of the range). One wavelength is simulated per bin, at its centre. |
+| `grid_step_nm` | `"grid"` and `"grid_modis"`: width of the wavelength bins in nm (default 10; at most a third of the range). One wavelength is simulated per bin, at its centre. For `"grid_modis"` it is the step inside each MODIS band (the bands are 18, 20 and 41 nm wide): about 2 nm is a good start. |
 | `cloud_source` | `"bundled"` (default: SMART-G's `cumulus.dat`), `"bomex"` (a cloud built from a BOMEX droplet-spectrum dataset, see [The BOMEX cloud](#the-bomex-cloud)) or `"none"` (no cloud: the clear-sky scene, see [The clear sky](#the-clear-sky)). |
 | `bomex_netcdf` | Path to the BOMEX `…com3D_int_2.nc` file (the one with the `FNCD` droplet spectrum). Required for `"bomex"`. |
 | `extinction_method` | `"q2"` (default: extinction with Q = 2, the paper's approximation) or `"mie"` (the Mie Q of each radius bin). Only used by `"bomex"`. |
@@ -220,6 +220,26 @@ setting `playground_core.SAVE_RADIANCE`, off by default).
   over a channel are smooth. Memory: SMART-G builds one phase matrix per wavelength and per distinct droplet radius, so
   this band set rounds the radius to 1 um (the spacing of SMART-G's cloud table) instead of 0.1 um; at 0.1 um a 30-wavelength
   run needs about 24 GB of host memory.
+
+- `"grid_modis"`: the same three MODIS bands as `"modis"` (b03 blue 456.0-473.7 nm, b04 green 545.5-565.2 nm, b01 red
+  625.3-666.6 nm, the limits stored in SMART-G's MODIS REPTRAN file), but **each band is simulated in its own SMART-G
+  run**, on a grid of wavelengths inside that band only (one per `grid_step_nm` bin, at its centre; about 2 nm is a good start:
+  9, 10 and 21 wavelengths). In each run the photons' wavelengths are drawn with `wavelength_proba` in proportion to the solar
+  irradiance x bin width (the band's response is taken as 1 inside its limits and 0 outside: real MODIS response curves are
+  not in SMART-G's files). Nothing outside the bands is simulated, so no wavelength has probability zero (an exact zero makes
+  SMART-G's `icdf` table fail, a tiny value makes it huge). The photons (`photons_per_pixel`) are split equally between the
+  three runs, so the total is what it would be in a single run; every channel is as precise as in `"grid"`, but all its
+  photons are inside the band (in `"grid"` only about a fifth to two fifths of a channel's photons fall inside a MODIS band).
+  The three runs share the geometry and, with the pointing error on, the same drawn pointing, so the channels line up. A
+  channel's reflectance is the weighted mean of its band's wavelengths, w = irradiance x bin width. The saved files are those of
+  `"grid"` (`<name>_spectral.npz` with the wavelengths of the three runs one after another, `<name>_stokes_spectral.npz` with
+  polarization, `<name>_wavelength_distribution.svg`), so the processing tool opens them the same way. The cost is three SMART-G
+  runs per render instead of one (the set-up is repeated), and for a cloud each run holds only its band's wavelengths in memory.
+  Checked on one clear-sky ocean scene (no cloud, 16000 photons per pixel): the three channels agree with `"modis"` to within 0.2-0.7 %,
+  which is the Monte Carlo noise (repeating `"modis"` alone varies by up to 3 % in the red channel at 4000 photons per pixel), the DoLP agrees
+  too, and steps of 1, 2 and 6 nm give the same channel values. Not yet tried with a cloud. Opening such a result in
+  `process_reflectance_gui.py` works as for `"grid"`; rebuilding the channels with other filters there only uses the wavelengths inside the three
+  bands.
 
 `channel` picks all three channels or one of them in either band set. The raw-reflectance figure and the printed
 statistics name the bands (for example `MODIS b03 (456-474 nm)`). Only the spectral side of a camera is

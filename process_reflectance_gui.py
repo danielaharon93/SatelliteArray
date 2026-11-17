@@ -26,9 +26,17 @@ What can be set (applied top to bottom):
      shows every simulated wavelength, the camera response behind it, and each channel's value
      over the wavelengths it covers; for other band sets only the channels, at their wavelengths.
 
+Polarization. A render made with "Save polarization" (clear sky only) also has <name>_stokes.npy,
+the Stokes parameters I, Q, U, V of every channel (shape (4, height, width, channels)), and, for the
+grid band set, <name>_stokes_spectral.npz (the Stokes parameters at every simulated wavelength). When
+<name>_stokes.npy sits beside the file, group 6 of the window can show the degree of linear
+polarization, DoLP = sqrt(Q^2 + U^2) / I, or its angle AoLP = atan2(U, Q) / 2 as a map (of the channel
+you choose), and plot DoLP or AoLP against wavelength for the clicked pixel. The wavelength options of
+group 2 rebuild the Stokes channels too. DoLP and AoLP do not depend on reflectance or radiance.
+
 Files next to <name>.npy that are used when they exist: <name>_radiance.json (the solar
 irradiance per channel and the sun zenith angle, written by run_bomex_headless.py with
-SAVE_RADIANCE) and <name>_spectral.npz (grid band set). Radiance needs the solar irradiance:
+SAVE_RADIANCE), <name>_spectral.npz (grid band set) and the two polarization files above. Radiance needs the solar irradiance:
 from the first, from the second, or, when neither exists, the values the playground uses for
 the band set that the file name gives (_modis, or none for 440 / 550 / 670 nm). The sun zenith
 angle comes from the json, or from the file name (rounded to whole degrees: edit it in the
@@ -58,6 +66,8 @@ NORMALISATIONS = ("none", "percentile")
 HIGHLIGHTS = ("clip", "rolloff")
 TONES = ("gamma", "srgb", "linear")
 VIEWS = ("colour", *CHANNEL_NAMES)
+MAPS = ("image", "dolp", "aolp")  # what the image pane shows: the colour image, or a polarization map
+PLOTS = ("spectrum", "dolp", "aolp")  # what the plot shows against wavelength
 
 
 # ----------------------------------------------------------------------------
@@ -80,10 +90,17 @@ class Loaded:
     bin_width_nm: np.ndarray | None = None
     group: np.ndarray | None = None  # the saved channel each wavelength belongs to
     channel_labels: tuple = ()  # the saved channels' names, when the files give them
+    stokes: np.ndarray | None = None  # (4, height, width, n_channels): I, Q, U, V, when polarization was saved
+    stokes_spectral: np.ndarray | None = None  # (4, height or 1, width or 1, n_wavelengths)
+    stokes_wavelength_nm: np.ndarray | None = None  # the wavelengths of stokes_spectral
 
     @property
     def has_spectral(self) -> bool:
         return self.spectral is not None
+
+    @property
+    def has_polarization(self) -> bool:
+        return self.stokes is not None
 
 
 # The solar irradiance (mW m-2 nm-1, blue, green, red) that run_bomex_headless.py and the
@@ -143,10 +160,13 @@ def _bin_widths(wavelength_nm: np.ndarray, group: np.ndarray) -> np.ndarray:
 
 
 def load(path: str | Path) -> Loaded:
-    """Load <name>.npy and the files next to it (a "_radiance" file name opens its reflectance)."""
+    """Load <name>.npy and the files next to it (a "_radiance", "_stokes" or "_stokes_spectral" file
+    name opens its reflectance)."""
     path = Path(path)
-    if path.stem.endswith("_radiance"):
-        path = path.with_name(path.stem[: -len("_radiance")] + ".npy")
+    for suffix in ("_radiance", "_stokes_spectral", "_stokes"):
+        if path.stem.endswith(suffix):
+            path = path.with_name(path.stem[: -len(suffix)] + ".npy")
+            break
     reflectance = np.load(path)
     if reflectance.ndim != 3:
         raise ValueError(f"{path.name} has shape {reflectance.shape}; expected (height, width, channels)")
@@ -189,6 +209,18 @@ def load(path: str | Path) -> Loaded:
                             [weight[group == k].sum() / loaded.bin_width_nm[group == k].sum() for k in range(group.max() + 1)]
                         )
                         loaded.irradiance_source = "from the per-wavelength file"
+
+    stokes_file = path.with_name(f"{path.stem}_stokes.npy")
+    if stokes_file.is_file():
+        cube = np.load(stokes_file).astype(float)
+        if cube.shape == (4, *reflectance.shape):
+            loaded.stokes = cube
+    stokes_spectral = path.with_name(f"{path.stem}_stokes_spectral.npz")
+    if loaded.stokes is not None and stokes_spectral.is_file():
+        with np.load(stokes_spectral) as data:
+            cube, wavelength = data["stokes"].astype(float), data["wavelength_nm"].astype(float)
+        if cube.ndim == 4 and cube.shape[0] == 4 and cube.shape[-1] == len(wavelength) and cube.shape[1:3] in ((1, 1), reflectance.shape[:2]):
+            loaded.stokes_spectral, loaded.stokes_wavelength_nm = cube, wavelength
     return loaded
 
 
@@ -215,6 +247,10 @@ class Settings:
     tone: str = "gamma"
     gamma: float = 1.8
     view: str = "colour"
+    map: str = "image"  # "dolp" or "aolp": show that polarization map instead of the image
+    pol_channel: str = "green"  # the channel the map is of
+    dolp_max_pct: float = 0.0  # the DoLP map's full scale, in percent; 0: the largest value
+    plot: str = "spectrum"  # what the plot shows against wavelength: "spectrum", "dolp" or "aolp"
 
 
 def load_response_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
@@ -248,14 +284,21 @@ def channels_from_wavelengths(loaded: Loaded, response: np.ndarray) -> tuple[np.
     """The three channels rebuilt from the per-wavelength reflectance with `response`:
     reflectance = sum(R E rho dl) / sum(R E dl), the same definition the simulation uses.
     Also the channels' mean solar irradiance, sum(R E dl) / sum(R dl). Returns (h, w, 3), (3,)."""
+    weight, total, dl = channel_weights(loaded, response)
+    reflectance = loaded.spectral @ weight / total
+    return reflectance, total / (response * dl).sum(axis=0)
+
+
+def channel_weights(loaded: Loaded, response: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(weight (n_wavelengths, 3), its sum per channel, the bin widths (n_wavelengths, 1)): a channel's
+    value is sum(value at each wavelength x weight) / sum(weight), weight = response x solar x bin width."""
     dl = loaded.bin_width_nm[:, None]
     weight = response * loaded.solar[:, None] * dl
     total = weight.sum(axis=0)
     if (total <= 0).any():
         empty = [CHANNEL_NAMES[k] for k in np.where(total <= 0)[0]]
         raise ValueError(f"the {', '.join(empty)} response is zero over all the simulated wavelengths")
-    reflectance = loaded.spectral @ weight / total
-    return reflectance, total / (response * dl).sum(axis=0)
+    return weight, total, dl
 
 
 def base_channels(loaded: Loaded, s: Settings) -> tuple[np.ndarray, np.ndarray | None]:
@@ -356,7 +399,96 @@ def process(loaded: Loaded, s: Settings, base: tuple | None = None) -> Result:
 
 
 # ----------------------------------------------------------------------------
-# reflectance (or radiance) against wavelength
+# polarization
+# ----------------------------------------------------------------------------
+
+NO_POLARIZATION = (
+    "this result has no polarization data: <name>_stokes.npy beside the file "
+    "(written when the render was made with 'Save polarization', clear sky only)"
+)
+
+
+def stokes_to_polarization(stokes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(4, ...) Stokes parameters I, Q, U, V -> (DoLP, AoLP in degrees), each of shape (...).
+    DoLP = sqrt(Q^2 + U^2) / I (0 to 1); AoLP = atan2(U, Q) / 2 in [-90, 90), measured from the
+    meridian plane of the viewing direction (the same as playground_core.stokes_to_polarization)."""
+    intensity, q, u = stokes[0], stokes[1], stokes[2]
+    dolp = np.where(intensity > 0, np.hypot(q, u) / np.where(intensity > 0, intensity, 1.0), 0.0)
+    aolp = (np.degrees(0.5 * np.arctan2(u, q)) + 90.0) % 180.0 - 90.0
+    return dolp, aolp
+
+
+def channel_stokes(loaded: Loaded, s: Settings) -> np.ndarray:
+    """The Stokes parameters I, Q, U, V of the three channels, (4, h, w, 3) in blue, green, red order:
+    as saved, or (s.spectral gaussian / csv) rebuilt from <name>_stokes_spectral.npz with the same
+    weights as the reflectance channels (the Stokes parameters are linear, so they combine alike)."""
+    if loaded.stokes is None:
+        raise ValueError(NO_POLARIZATION)
+    if s.spectral == "saved":
+        stokes = loaded.stokes
+        if stokes.shape[-1] == 1:  # a single wavelength: gray
+            stokes = np.repeat(stokes, 3, axis=-1)
+        elif stokes.shape[-1] != 3:
+            raise ValueError(f"expected 1 or 3 channels, the file has {stokes.shape[-1]}")
+        return stokes
+    if (
+        loaded.stokes_spectral is None
+        or not loaded.has_spectral
+        or len(loaded.stokes_wavelength_nm) != len(loaded.wavelength_nm)
+    ):
+        raise ValueError(
+            "the polarization of rebuilt channels needs <name>_stokes_spectral.npz and <name>_spectral.npz "
+            "(grid band set, with 'Save polarization'): choose 'As simulated'"
+        )
+    weight, total, _ = channel_weights(loaded, response_matrix(loaded, s))
+    stokes = loaded.stokes_spectral @ weight / total  # (4, 1 or h, 1 or w, 3)
+    if stokes.shape[1:3] != loaded.reflectance.shape[:2]:  # the clear sky: one pixel stands for the image
+        stokes = np.broadcast_to(stokes, (4, *loaded.reflectance.shape[:2], 3)).copy()
+    return stokes
+
+
+def polarization_statistics(stokes: np.ndarray, what: str, channel: str) -> str:
+    """Per channel: the range of the DoLP over the image, and the AoLP of the mean Stokes parameters."""
+    dolp, _ = stokes_to_polarization(stokes)
+    _, aolp_mean = stokes_to_polarization(stokes.reshape(4, -1, stokes.shape[-1]).mean(axis=1))
+    lines = [f"Linear polarization ({'DoLP' if what == 'dolp' else 'AoLP'} map of the {channel} channel):"]
+    for k, name in enumerate(CHANNEL_NAMES):
+        v = 100.0 * dolp[..., k]
+        lines.append(
+            f"  {name:5s} DoLP min {v.min():.3g} %  median {np.median(v):.3g} %  max {v.max():.3g} %   "
+            f"AoLP of the mean {aolp_mean[k]:+.1f} deg"
+        )
+    return "\n".join(lines)
+
+
+def polarization_image(loaded: Loaded, s: Settings) -> tuple[np.ndarray, str]:
+    """The map s.map ("dolp": viridis, 0 to the full scale; "aolp": twilight, -90 to 90 deg, cyclic) of
+    the channel s.pol_channel, as an (h, w, 3) uint8 image in red, green, blue order, and a text."""
+    from matplotlib import colormaps
+
+    stokes = channel_stokes(loaded, s)
+    dolp, aolp = stokes_to_polarization(stokes)
+    k = CHANNEL_NAMES.index(s.pol_channel)
+    if s.map == "dolp":
+        top = s.dolp_max_pct / 100.0 if s.dolp_max_pct > 0 else max(float(dolp[..., k].max()), 1e-9)
+        rgba = colormaps["viridis"](np.clip(dolp[..., k] / top, 0.0, 1.0))
+        scale = f"viridis: dark = 0 %, bright = {100.0 * top:.3g} %"
+    elif s.map == "aolp":
+        rgba = colormaps["twilight"]((aolp[..., k] + 90.0) / 180.0)
+        scale = "twilight, cyclic: -90 and +90 deg look the same"
+    else:
+        raise ValueError(f"unknown map {s.map!r}")
+    image = (rgba[..., :3] * 255.0 + 0.5).astype(np.uint8)
+    return image, polarization_statistics(stokes, s.map, s.pol_channel) + f"\n  {scale}"
+
+
+def polarization_array(loaded: Loaded, s: Settings) -> np.ndarray:
+    """(2, h, w, 3): DoLP (0 to 1) and AoLP (degrees) of the three channels, blue, green, red."""
+    return np.stack(stokes_to_polarization(channel_stokes(loaded, s)))
+
+
+# ----------------------------------------------------------------------------
+# reflectance (or radiance, or polarization) against wavelength
 # ----------------------------------------------------------------------------
 
 # The wavelengths of the channels, for a result without per-wavelength data.
@@ -404,6 +536,16 @@ class SpectrumData:
     bars: list  # per channel: (low nm, high nm, value, name, colour)
     ylabel: str
     where: str
+    ylim: tuple | None = None
+
+
+def _pick(loaded: Loaded, pixel: tuple[int, int] | None):
+    """(index into a (h, w, ...) array, text): the whole image, or the pixel (x, y)."""
+    height, width = loaded.reflectance.shape[:2]
+    if pixel is None:
+        return (slice(None), slice(None)), "mean over the image"
+    x, y = min(max(int(pixel[0]), 0), width - 1), min(max(int(pixel[1]), 0), height - 1)
+    return (y, x), f"pixel x={x}, y={y}"
 
 
 def spectrum_plot_data(
@@ -411,25 +553,60 @@ def spectrum_plot_data(
 ) -> SpectrumData:
     """The reflectance (or, with s.quantity radiance, the spectral radiance in W m-2 um-1 sr-1) at
     every simulated wavelength, averaged over the image or at one pixel (x, y), and each channel's
-    value over the wavelengths it covers. `base` is base_channels() when the caller has it."""
+    value over the wavelengths it covers. With s.plot "dolp" or "aolp" the degree (%) or angle (deg) of
+    linear polarization instead. `base` is base_channels() when the caller has it."""
+    if s.plot in ("dolp", "aolp"):
+        return polarization_plot_data(loaded, s, pixel)
     channels, _ = base if base is not None else base_channels(loaded, s)
-    height, width = channels.shape[:2]
-    if pixel is None:
-        pick, where = (slice(None), slice(None)), "mean over the image"
-    else:
-        x, y = min(max(int(pixel[0]), 0), width - 1), min(max(int(pixel[1]), 0), height - 1)
-        pick, where = (y, x), f"pixel x={x}, y={y}"
+    pick, where = _pick(loaded, pixel)
     radiance = s.quantity == "radiance"
     n_bars = 3 if s.spectral != "saved" else loaded.reflectance.shape[-1]
     values = channels[pick].reshape(-1, channels.shape[-1]).mean(axis=0)[:n_bars]
     cos_sza_over_pi = np.cos(np.radians(s.sza_deg)) / np.pi
 
-    lam = vals = response = None
+    lam = vals = None
     if loaded.has_spectral:
         lam = loaded.wavelength_nm
         vals = loaded.spectral[pick].reshape(-1, len(lam)).mean(axis=0)
         if radiance:
             vals = vals * loaded.solar * cos_sza_over_pi
+    ylabel = "Spectral radiance\n(W m-2 um-1 sr-1)" if radiance else "Reflectance"
+    return _spectrum_layout(loaded, s, n_bars, values, lam, vals, ylabel, where)
+
+
+def polarization_plot_data(loaded: Loaded, s: Settings, pixel: tuple[int, int] | None = None) -> SpectrumData:
+    """DoLP (%) or AoLP (deg) against wavelength at one pixel (or the image mean), from the Stokes
+    parameters at every simulated wavelength when the result has them, and of each channel."""
+    stokes = channel_stokes(loaded, s)
+    pick, where = _pick(loaded, pixel)
+    n_bars = 3 if s.spectral != "saved" else loaded.reflectance.shape[-1]
+    dolp_pct = s.plot == "dolp"
+
+    def value(stokes_mean):  # (4, n) mean Stokes parameters -> DoLP in % or AoLP in degrees
+        dolp, aolp = stokes_to_polarization(stokes_mean)
+        return 100.0 * dolp if dolp_pct else aolp
+
+    # the polarization of the mean Stokes parameters (the mean of AoLP itself would be wrong: it is cyclic)
+    values = value(stokes[:, pick[0], pick[1]].reshape(4, -1, stokes.shape[-1]).mean(axis=1))[:n_bars]
+    lam = vals = None
+    if loaded.stokes_spectral is not None:
+        lam = loaded.stokes_wavelength_nm
+        cube = loaded.stokes_spectral
+        if cube.shape[1:3] == (1, 1):
+            vals = value(cube[:, 0, 0, :])
+        else:
+            vals = value(cube[:, pick[0], pick[1]].reshape(4, -1, cube.shape[-1]).mean(axis=1))
+    ylabel = "DoLP (%)" if dolp_pct else "AoLP (deg)"
+    data = _spectrum_layout(loaded, s, n_bars, values, lam, vals, ylabel, where)
+    data.ylim = (0.0, None) if dolp_pct else (-95.0, 95.0)
+    return data
+
+
+def _spectrum_layout(loaded, s, n_bars, values, lam, vals, ylabel, where) -> SpectrumData:
+    """What the plot shows around the values: each channel's wavelength range (a bar of its value) and,
+    where the per-wavelength data allow, the camera response behind the curve."""
+    response = None
+    if lam is not None and loaded.has_spectral and len(lam) == len(loaded.wavelength_nm):
         if s.spectral != "saved":
             response = response_matrix(loaded, s)
         elif loaded.group is not None and loaded.group.max() + 1 == n_bars:
@@ -451,7 +628,6 @@ def spectrum_plot_data(
         else:
             continue
         bars.append((float(low), float(high), float(values[k]), names[k], colours[k]))
-    ylabel = "Spectral radiance\n(W m-2 um-1 sr-1)" if radiance else "Reflectance"
     return SpectrumData(lam, vals, response, bars, ylabel, where)
 
 
@@ -479,6 +655,8 @@ def draw_spectrum(figure, data: SpectrumData) -> None:
     ax.set_xlabel("Wavelength (nm)")
     ax.set_ylabel(data.ylabel)
     ax.set_title(data.where, fontsize=9)
+    if data.ylim is not None:
+        ax.set_ylim(*data.ylim)
     ax.grid(alpha=0.3)
     if data.wavelength_nm is not None or data.bars:
         ax.legend(fontsize=8, loc="upper right")
@@ -585,6 +763,7 @@ def run_window(initial: str | None = None, run: bool = True):
             column.addWidget(self._group_colour())
             column.addWidget(self._group_display())
             column.addWidget(self._group_plot())
+            column.addWidget(self._group_polarization())
             column.addWidget(self.message)
             column.addStretch(1)
             scroll = QtWidgets.QScrollArea()
@@ -776,6 +955,39 @@ def run_window(initial: str | None = None, run: bool = True):
             form.addRow("Pixel (or click the image)", row)
             return group
 
+        def _group_polarization(self):
+            group = QtWidgets.QGroupBox("6  Polarization")
+            form = QtWidgets.QFormLayout(group)
+            self.pol_note = QtWidgets.QLabel("")
+            self.pol_note.setWordWrap(True)
+            self.pol_map = self._combo(
+                [
+                    ("image", "The image above"),
+                    ("dolp", "Degree of linear polarization (DoLP)"),
+                    ("aolp", "Angle of linear polarization (AoLP)"),
+                ],
+                "DoLP = sqrt(Q^2 + U^2) / I, 0 to 100 %. AoLP = atan2(U, Q) / 2, -90 to 90 deg, from the "
+                "meridian plane of the viewing direction",
+            )
+            self.pol_channel = self._combo([(n, n.capitalize()) for n in CHANNEL_NAMES], "The channel the map is of")
+            self.pol_channel.setCurrentIndex(CHANNEL_NAMES.index(Settings.pol_channel))
+            self.dolp_max = self._spin(0, 100, 0.0, 5, 1, " %", "The DoLP map's full scale; 0: the largest value in the image")
+            self.pol_plot = self._combo(
+                [
+                    ("spectrum", "Reflectance (or radiance)"),
+                    ("dolp", "DoLP (%)"),
+                    ("aolp", "AoLP (deg)"),
+                ],
+                "What the plot of group 5 shows against wavelength, for the clicked pixel",
+            )
+            form.addRow(self.pol_note)
+            form.addRow("Show", self.pol_map)
+            form.addRow("Of the channel", self.pol_channel)
+            form.addRow("DoLP full scale", self.dolp_max)
+            form.addRow("Plot (group 5)", self.pol_plot)
+            self.pol_group = group
+            return group
+
         def _plot_toggled(self, shown):
             self.plot_box.setVisible(shown)
             self._changed()
@@ -823,6 +1035,10 @@ def run_window(initial: str | None = None, run: bool = True):
                 tone=self.tone.currentData(),
                 gamma=self.gamma.value(),
                 view=self.show_channel.currentData(),
+                map=self.pol_map.currentData(),
+                pol_channel=self.pol_channel.currentData(),
+                dolp_max_pct=self.dolp_max.value(),
+                plot=self.pol_plot.currentData(),
             )
 
         def _sync_enabled(self):
@@ -834,6 +1050,11 @@ def run_window(initial: str | None = None, run: bool = True):
             self.gamma.setEnabled(self.tone.currentData() == "gamma")
             self.sza.setEnabled(self.quantity.currentData() == "radiance")
             self.white_balance.model().item(1).setEnabled(self.quantity.currentData() == "radiance")
+            has_polarization = self.loaded is not None and self.loaded.has_polarization
+            for box in (self.pol_map, self.pol_channel, self.pol_plot):
+                box.setEnabled(has_polarization)
+            self.dolp_max.setEnabled(has_polarization and self.pol_map.currentData() == "dolp")
+            self.pol_channel.setEnabled(has_polarization and self.pol_map.currentData() != "image")
 
         def _changed(self, *_):
             if self._building:
@@ -886,8 +1107,21 @@ def run_window(initial: str | None = None, run: bool = True):
                 if loaded.has_spectral
                 else "No per-wavelength data (only the saved channels can be used)."
             )
+            parts.append(
+                "Polarization: Stokes I, Q, U, V of the channels"
+                + (" and at every wavelength." if loaded.stokes_spectral is not None else ".")
+                if loaded.has_polarization
+                else "No polarization data (no _stokes.npy beside the file)."
+            )
             self.info.setText("\n".join(parts))
+            self.pol_note.setText(
+                "Needs <name>_stokes.npy (render with 'Save polarization')." if not loaded.has_polarization
+                else "The map replaces the image above; DoLP and AoLP do not depend on the quantity or the gains."
+            )
             self._building = True
+            if not loaded.has_polarization:  # nothing to show: back to the image and the spectrum
+                self.pol_map.setCurrentIndex(0)
+                self.pol_plot.setCurrentIndex(0)
             if loaded.sza_deg is not None:
                 self.sza.setValue(loaded.sza_deg)
             if not loaded.has_spectral:  # the wavelength options need <name>_spectral.npz
@@ -915,6 +1149,12 @@ def run_window(initial: str | None = None, run: bool = True):
                 self._cache_key = None
                 self.say(str(exc))
                 return
+            if s.map != "image":
+                try:
+                    self.result.image, self.result.text = polarization_image(self.loaded, s)
+                except Exception as exc:  # no polarization data, or rebuilt channels it cannot make
+                    self.say(str(exc))
+                    return
             self.say("")
             self.view.show_array(self.result.image)
             self.stats.setPlainText(self.result.text)
@@ -947,7 +1187,15 @@ def run_window(initial: str | None = None, run: bool = True):
             if path:
                 np.save(path, self.result.linear)  # blue, green, red, like the input
                 Path(path).with_suffix(".json").write_text(self._settings_json())
-                self.say(f"Saved {Path(path).name} (blue, green, red) and its settings (.json).", ok=True)
+                text = f"Saved {Path(path).name} (blue, green, red) and its settings (.json)."
+                if self.loaded.has_polarization:
+                    try:
+                        pol_path = Path(path).with_name(f"{Path(path).stem}_polarization.npy")
+                        np.save(pol_path, polarization_array(self.loaded, self.settings()))
+                        text += f" And {pol_path.name}: DoLP (0-1) and AoLP (deg), shape (2, height, width, 3)."
+                    except Exception as exc:
+                        text += f" The polarization was not saved: {exc}"
+                self.say(text, ok=True)
 
         def _settings_json(self) -> str:
             return json.dumps({"source": str(self.loaded.path), **asdict(self.settings())}, indent=2)

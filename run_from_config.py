@@ -29,7 +29,8 @@ CHANNEL = None
 # What a channel is: "rgb" (single wavelengths: 440, 550 and 670 nm), "modis"
 # (the MODIS Terra channels b03, b04 and b01, simulated as REPTRAN bands) or
 # "grid" (a grid of wavelengths over the camera's range, see grid_range_nm in the
-# scenario file). None uses the scenario file's own "band_set" setting.
+# scenario file) or "grid_modis" (the three MODIS bands, each in its own SMART-G run on a
+# grid of wavelengths inside that band, see grid_step_nm). None uses the scenario file's own "band_set" setting.
 BAND_SET = None
 
 # No display on this kind of machine: keep Traits/Pyface on their no-GUI

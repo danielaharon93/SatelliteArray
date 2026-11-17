@@ -287,7 +287,9 @@ class SmartgPlayground(HasTraits):
                     tooltip=(
                         "rgb: single wavelengths (440, 550, 670 nm); modis: the MODIS Terra "
                         "channels b03, b04, b01, simulated as REPTRAN bands; grid: a grid of "
-                        "wavelengths over the camera's range, sampled by response x solar irradiance"
+                        "wavelengths over the camera's range, sampled by response x solar irradiance; "
+                        "grid_modis: three SMART-G runs, one per MODIS band, each on a grid of wavelengths "
+                        "inside that band only"
                     ),
                 ),
                 Item(
@@ -300,14 +302,17 @@ class SmartgPlayground(HasTraits):
                 ),
             ),
             VGroup(
-                Item("grid_range_low_nm", label="Camera range from (nm)"),
-                Item("grid_range_high_nm", label="to (nm)"),
+                Item("grid_range_low_nm", label="Camera range from (nm)", enabled_when="band_set == 'grid'"),
+                Item("grid_range_high_nm", label="to (nm)", enabled_when="band_set == 'grid'"),
                 Item(
                     "grid_step_nm",
                     label="Grid step (nm)",
-                    tooltip="Bin width of the wavelength grid; the range is split into equal thirds for blue, green and red",
+                    tooltip=(
+                        "Bin width of the wavelength grid. grid: the range is split into equal thirds for blue, green and "
+                        "red. grid_modis: the step inside each MODIS band (about 2 nm is a good start; the range is not used)"
+                    ),
                 ),
-                visible_when="band_set == 'grid'",
+                visible_when="band_set in ('grid', 'grid_modis')",
             ),
             VGroup(
                 Item("periodic", label="Periodic domain", enabled_when="cloud_source != 'none'"),
