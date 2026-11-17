@@ -66,9 +66,10 @@ RENDER = True
 SAVE_RADIANCE = True
 
 # True: also save, in each dataset's output folder, wavelength_distribution.pdf: the
-# probability with which SMART-G draws each photon's wavelength (for the grid band set the
-# solar irradiance behind it too; for the rgb and modis band sets a uniform draw among the
-# few simulated wavelengths).
+# probability with which SMART-G draws each photon's wavelength (for the grid and grid_modis
+# band sets the solar irradiance behind it too, and for grid_modis the three runs, one per
+# MODIS band, each with 1/3 of the photons; for the rgb and modis band sets a uniform draw
+# among the few simulated wavelengths).
 SAVE_WAVELENGTH_DISTRIBUTION = True
 
 # Where things are written: the cloud files (one per dataset and setting, reused
