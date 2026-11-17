@@ -29,8 +29,9 @@ import pointing_noise
 
 OUTPUT_DIR = Path(__file__).with_name("smartg_playground_images")
 CONFIG_DIR = Path(__file__).with_name("configs")
-# True: every saved image also gets its radiance (W m-2 um-1 sr-1) next to the
-# reflectance, as <name>_radiance.npy and <name>_radiance.json. A module setting,
+# Every saved image gets <name>_radiance.json next to its reflectance (the solar irradiance,
+# sun zenith angle and the scene's geometry, enough to convert it to radiance). True: it also
+# gets its radiance (W m-2 um-1 sr-1) as <name>_radiance.npy. A module setting,
 # not a scenario one: run_bomex_headless.py turns it on.
 SAVE_RADIANCE = False
 
@@ -1772,25 +1773,53 @@ class PlaygroundSimulation:
             spectrum, png_path.with_name(f"{png_path.stem}_wavelength_distribution.svg")
         )
 
-    def _save_radiance(self, config: PlaygroundConfig, reflectance: np.ndarray, png_path: Path) -> str:
-        """With SAVE_RADIANCE, save the radiance of one view next to its reflectance:
-        <name>_radiance.npy (W m-2 um-1 sr-1, the shape of the reflectance image) and
-        <name>_radiance.json (the unit, the channels, the irradiance and sun zenith
-        angle that turn the reflectance into it). Returns a line of text, or ""."""
-        if not SAVE_RADIANCE:
-            return ""
+    def _save_radiance(
+        self, config: PlaygroundConfig, reflectance: np.ndarray, png_path: Path, satellite_index: int | None = None
+    ) -> str:
+        """Save <name>_radiance.json next to a view's reflectance, always: what is needed to turn
+        the reflectance into a radiance (the channels' solar irradiance and the sun zenith angle)
+        and how the image was made (band set, wavelengths, sun and view directions, time,
+        satellite position, the whole scenario). With SAVE_RADIANCE, also <name>_radiance.npy
+        (W m-2 um-1 sr-1, the shape of the reflectance image). Returns a line of text, or ""."""
         spectrum = config_spectrum(config)
-        radiance = radiance_from_reflectance(reflectance, config.sza_deg, spectrum)
-        np.save(png_path.with_name(f"{png_path.stem}_radiance.npy"), radiance)
+        wavelengths = (
+            spectrum.representative_nm if spectrum.representative_nm is not None
+            else np.asarray(spectrum.run_wavelength, float)
+        )
+        group = spectrum.group if spectrum.group is not None else np.arange(len(wavelengths))
+        channel_range = {
+            label: [float(wavelengths[group == k].min()), float(wavelengths[group == k].max())]
+            for k, label in enumerate(spectrum.labels)
+            if (group == k).any()
+        }
+        if satellite_index is None:
+            position = self.position_km
+            view = {"off_nadir_deg": config.off_nadir_deg, "azimuth_deg": config.view_azimuth_deg}
+        else:
+            position = self.formation_positions_km[satellite_index]
+            view = {"satellite_index": satellite_index, "looking_at": "the formation's common ground point"}
         description = {
             "unit": "W m-2 um-1 sr-1 (the unit of MODIS L1B radiances)",
             "formula": "radiance = reflectance * channel_irradiance * cos(sza) / pi",
             "channels": list(spectrum.labels),
             "channel_irradiance_mW_m2_nm": [float(e) for e in spectrum.channel_irradiance],
             "sza_deg": config.sza_deg,
+            "saa_deg": config.saa_deg,
             "sun_distance": "1 astronomical unit (no Earth-Sun distance factor)",
+            "band_set": config.band_set,
+            "simulated_wavelengths_nm": [float(w) for w in wavelengths],
+            "channel_of_wavelength": [int(g) for g in group],
+            "channel_wavelength_range_nm": channel_range,
+            "view": view,
+            "time_utc": self.time_utc,
+            "satellite_position_itrs_km": [float(x) for x in np.asarray(position, float)],
+            "scenario": asdict(config),
         }
-        png_path.with_name(f"{png_path.stem}_radiance.json").write_text(json.dumps(description, indent=2))
+        png_path.with_name(f"{png_path.stem}_radiance.json").write_text(json.dumps(description, indent=2, default=str))
+        if not SAVE_RADIANCE:
+            return ""
+        radiance = radiance_from_reflectance(reflectance, config.sza_deg, spectrum)
+        np.save(png_path.with_name(f"{png_path.stem}_radiance.npy"), radiance)
         means = ", ".join(f"{label} {float(radiance[..., k].mean()):.1f}" for k, label in enumerate(spectrum.labels))
         return f"Mean radiance (W m-2 um-1 sr-1): {means}"
 
@@ -2009,7 +2038,7 @@ class PlaygroundSimulation:
             main.reflectance_to_image(images[index], gain=gain, gamma=1.8).save(path)
             np.save(path.with_suffix(".npy"), images[index])  # raw, un-clipped
             self._save_spectral(config, spectral.get(index), path)
-            radiance_summary = self._save_radiance(config, images[index], path)
+            radiance_summary = self._save_radiance(config, images[index], path, satellite_index=index)
             polarization_summary = self._save_polarization(config, stokes.get(index), path)
             save_reflectance_figure(
                 images[index],

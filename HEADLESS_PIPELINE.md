@@ -182,14 +182,18 @@ wavelength. For the grid band set it is response × solar irradiance × bin widt
 irradiance per bin in a panel above); for the `rgb` and `modis` band sets the draw is uniform
 among the few simulated wavelengths (1/3 each for three channels).
 
-With `SAVE_RADIANCE = True` (the default there) every image also gets its **radiance**
-next to the reflectance: `<name>_radiance.npy`, the same shape as `<name>.npy`, in
-W m⁻² µm⁻¹ sr⁻¹ (the unit of MODIS L1B radiances), and `<name>_radiance.json` with the
-channel names, each channel's mean solar irradiance and the sun zenith angle. The radiance
+Every image gets a `<name>_radiance.json` next to its reflectance (always, in the GUI and
+in every headless script): the channel names, each channel's mean solar irradiance, the sun
+zenith and azimuth angles, the band set and simulated wavelengths, the view direction, the
+time, the satellite's position and the whole scenario. `process_reflectance_gui.py` reads
+the sun zenith angle and the irradiance from it, so no config file has to be chosen. With
+`SAVE_RADIANCE = True` (the default in `run_bomex_headless.py`; the module setting
+`playground_core.SAVE_RADIANCE`, off by default elsewhere) every image also gets its
+**radiance**: `<name>_radiance.npy`, the same shape as `<name>.npy`, in
+W m⁻² µm⁻¹ sr⁻¹ (the unit of MODIS L1B radiances). The radiance
 is `reflectance × E0 × cos(sun zenith) / π`, with E0 the channel's response-weighted mean
 solar irradiance (at one astronomical unit, no Earth-Sun distance factor). The reflectance
-files are unchanged. The GUI and `run_from_config.py` do not write it (it is the module
-setting `playground_core.SAVE_RADIANCE`, off by default).
+files are unchanged.
 
 ### Band sets
 

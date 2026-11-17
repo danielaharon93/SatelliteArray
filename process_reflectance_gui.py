@@ -90,6 +90,7 @@ class Loaded:
     bin_width_nm: np.ndarray | None = None
     group: np.ndarray | None = None  # the saved channel each wavelength belongs to
     channel_labels: tuple = ()  # the saved channels' names, when the files give them
+    description: dict | None = None  # the contents of <name>_radiance.json, when it exists
     stokes: np.ndarray | None = None  # (4, height, width, n_channels): I, Q, U, V, when polarization was saved
     stokes_spectral: np.ndarray | None = None  # (4, height or 1, width or 1, n_wavelengths)
     stokes_wavelength_nm: np.ndarray | None = None  # the wavelengths of stokes_spectral
@@ -179,6 +180,7 @@ def load(path: str | Path) -> Loaded:
         loaded.irradiance = np.array(description["channel_irradiance_mW_m2_nm"], float)
         loaded.irradiance_source = "from the _radiance.json"
         loaded.channel_labels = tuple(description.get("channels", ()))
+        loaded.description = description
     elif (guess := assumed_irradiance(path, reflectance.shape[-1])) is not None:
         loaded.irradiance, loaded.irradiance_source = guess
 
@@ -1095,6 +1097,17 @@ def run_window(initial: str | None = None, run: bool = True):
             parts = [f"{loaded.path.name.replace('_', '_' + chr(0x200b))}: {loaded.reflectance.shape[1]} x {loaded.reflectance.shape[0]} pixels, "
                      f"{loaded.reflectance.shape[2]} channel(s)."]
             parts.append("Sun zenith " + (f"{loaded.sza_deg:g} deg." if loaded.sza_deg is not None else "unknown."))
+            if loaded.description is not None:
+                d = loaded.description
+                parts.append(
+                    f"From the _radiance.json: band set {d.get('band_set', '?')}, sun azimuth {d.get('saa_deg', '?')} deg, "
+                    f"time {d.get('time_utc', '?')}."
+                )
+            else:
+                parts.append(
+                    "WARNING: no _radiance.json beside the file, so the sun zenith (from the file name, rounded) "
+                    "and the solar irradiance (a built-in table) are guesses; check them before trusting a radiance."
+                )
             parts.append(
                 "Solar irradiance per channel: " + ", ".join(f"{e:.0f}" for e in loaded.irradiance)
                 + f" mW m-2 nm-1 ({loaded.irradiance_source})."
