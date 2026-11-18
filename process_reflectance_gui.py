@@ -50,7 +50,7 @@ no SMART-G.
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -104,6 +104,18 @@ class Loaded:
     @property
     def has_spectral(self) -> bool:
         return self.spectral is not None
+
+    @property
+    def single_index(self) -> int | None:
+        """0 blue, 1 green, 2 red when the result is a single-channel run (one saved channel) whose
+        channel is known, from the _radiance.json's scenario or the file name (_blue, _green, _red);
+        else None. A rebuilt single channel uses only that channel's camera response."""
+        if self.reflectance.shape[-1] != 1:
+            return None
+        name = ((self.description or {}).get("scenario") or {}).get("channel")
+        if name in CHANNEL_NAMES:
+            return CHANNEL_NAMES.index(name)
+        return name_band_info(self.path)[1]
 
     @property
     def has_polarization(self) -> bool:
@@ -273,7 +285,14 @@ def load_response_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def response_matrix(loaded: Loaded, s: Settings) -> np.ndarray:
-    """(n_wavelengths, 3): the camera's response at each simulated wavelength."""
+    """(n_wavelengths, 3): the camera's response at each simulated wavelength; (n_wavelengths, 1), that of
+    the one channel, for a single-channel run (see Loaded.single_index)."""
+    full = _full_response(loaded, s)
+    k = loaded.single_index
+    return full if k is None else full[:, [k]]
+
+
+def _full_response(loaded: Loaded, s: Settings) -> np.ndarray:
     lam = loaded.wavelength_nm
     if s.spectral == "gaussian":
         centre, fwhm = np.array(s.centres_nm, float), np.array(s.fwhm_nm, float)
@@ -308,7 +327,8 @@ def channel_weights(loaded: Loaded, response: np.ndarray) -> tuple[np.ndarray, n
     weight = response * loaded.solar[:, None] * dl
     total = weight.sum(axis=0)
     if (total <= 0).any():
-        empty = [CHANNEL_NAMES[k] for k in np.where(total <= 0)[0]]
+        names = CHANNEL_NAMES if len(total) == 3 else (CHANNEL_NAMES[loaded.single_index],)
+        empty = [names[k] for k in np.where(total <= 0)[0]]
         raise ValueError(f"the {', '.join(empty)} response is zero over all the simulated wavelengths")
     return weight, total, dl
 
@@ -330,6 +350,8 @@ def base_channels(loaded: Loaded, s: Settings) -> tuple[np.ndarray, np.ndarray |
                 "and is written only for the grid band set): choose 'As simulated'"
             )
         reflectance, irradiance = channels_from_wavelengths(loaded, response_matrix(loaded, s))
+        if reflectance.shape[-1] == 1:  # a single-channel run: gray, as for the saved channel
+            reflectance, irradiance = np.repeat(reflectance, 3, axis=-1), np.repeat(irradiance, 3)
     if s.quantity == "reflectance":
         return reflectance, irradiance
     if s.quantity != "radiance":
@@ -380,6 +402,29 @@ def to_display(linear: np.ndarray, s: Settings) -> np.ndarray:
     return (np.clip(x, 0.0, 1.0)[..., ::-1] * 255.0 + 0.5).astype(np.uint8)  # B, G, R -> R, G, B
 
 
+@dataclass
+class Legend:
+    """The colour bar under the image: `ramp` (n, 3) uint8 RGB from `low` to `high`, and its caption."""
+
+    ramp: np.ndarray
+    low: float
+    high: float
+    label: str
+
+
+def image_legend(s: Settings) -> Legend:
+    """The grey ramp the image's values go through: the linear value (after the processing) from 0 to
+    the white level, shown with the highlight handling and tone curve in `s`. Values above the right
+    end look like it (clip) or approach white (rolloff)."""
+    top = 1.0 if s.highlights == "clip" else 4.0
+    x = np.linspace(0.0, top, 256)
+    ramp = to_display(np.repeat(x[None, :, None], 3, axis=-1), replace(s, view="colour"))[0]
+    unit = "reflectance" if s.quantity == "reflectance" else "W m-2 um-1 sr-1"
+    after = ", after the processing" if (s.normalisation == "percentile" or s.gain != 1.0 or s.saturation != 1.0 or s.white_balance != "none") else ""
+    where = "" if s.view == "colour" else f" ({s.view} channel)"
+    return Legend(ramp, 0.0, top, f"Linear value, {unit}{after}{where}: grey = displayed brightness")
+
+
 def statistics(linear: np.ndarray, unit: str) -> str:
     """Per channel: the linear values the display curve is applied to."""
     lines = [f"Linear values before the tone curve ({unit}):"]
@@ -398,6 +443,7 @@ class Result:
     linear: np.ndarray  # after white balance, gains, normalisation, gain, saturation
     image: np.ndarray  # the displayed (h, w, 3) uint8, red, green, blue
     text: str
+    legend: "Legend | None" = None
 
 
 def process(loaded: Loaded, s: Settings, base: tuple | None = None) -> Result:
@@ -407,7 +453,7 @@ def process(loaded: Loaded, s: Settings, base: tuple | None = None) -> Result:
     unit = "reflectance" if s.quantity == "reflectance" else "W m-2 um-1 sr-1"
     if s.normalisation == "percentile" or s.gain != 1.0 or s.saturation != 1.0 or s.white_balance != "none":
         unit += ", after the processing"
-    return Result(base_values, linear, to_display(linear, s), statistics(linear, unit))
+    return Result(base_values, linear, to_display(linear, s), statistics(linear, unit), image_legend(s))
 
 
 # ----------------------------------------------------------------------------
@@ -454,6 +500,8 @@ def channel_stokes(loaded: Loaded, s: Settings) -> np.ndarray:
         )
     weight, total, _ = channel_weights(loaded, response_matrix(loaded, s))
     stokes = loaded.stokes_spectral @ weight / total  # (4, 1 or h, 1 or w, 3)
+    if stokes.shape[-1] == 1:  # a single-channel run: gray
+        stokes = np.repeat(stokes, 3, axis=-1)
     if stokes.shape[1:3] != loaded.reflectance.shape[:2]:  # the clear sky: one pixel stands for the image
         stokes = np.broadcast_to(stokes, (4, *loaded.reflectance.shape[:2], 3)).copy()
     return stokes
@@ -473,7 +521,7 @@ def polarization_statistics(stokes: np.ndarray, what: str, channel: str) -> str:
     return "\n".join(lines)
 
 
-def polarization_image(loaded: Loaded, s: Settings) -> tuple[np.ndarray, str]:
+def polarization_image(loaded: Loaded, s: Settings) -> tuple[np.ndarray, str, Legend]:
     """The map s.map ("dolp": viridis, 0 to the full scale; "aolp": twilight, -90 to 90 deg, cyclic) of
     the channel s.pol_channel, as an (h, w, 3) uint8 image in red, green, blue order, and a text."""
     from matplotlib import colormaps
@@ -485,13 +533,19 @@ def polarization_image(loaded: Loaded, s: Settings) -> tuple[np.ndarray, str]:
         top = s.dolp_max_pct / 100.0 if s.dolp_max_pct > 0 else max(float(dolp[..., k].max()), 1e-9)
         rgba = colormaps["viridis"](np.clip(dolp[..., k] / top, 0.0, 1.0))
         scale = f"viridis: dark = 0 %, bright = {100.0 * top:.3g} %"
+        bar = np.linspace(0.0, 1.0, 256)
+        legend = Legend((colormaps["viridis"](bar)[:, :3] * 255.0 + 0.5).astype(np.uint8), 0.0, 100.0 * top,
+                        f"DoLP (%), {s.pol_channel} channel")
     elif s.map == "aolp":
         rgba = colormaps["twilight"]((aolp[..., k] + 90.0) / 180.0)
         scale = "twilight, cyclic: -90 and +90 deg look the same"
+        bar = np.linspace(0.0, 1.0, 256)
+        legend = Legend((colormaps["twilight"](bar)[:, :3] * 255.0 + 0.5).astype(np.uint8), -90.0, 90.0,
+                        f"AoLP (deg), {s.pol_channel} channel (cyclic)")
     else:
         raise ValueError(f"unknown map {s.map!r}")
     image = (rgba[..., :3] * 255.0 + 0.5).astype(np.uint8)
-    return image, polarization_statistics(stokes, s.map, s.pol_channel) + f"\n  {scale}"
+    return image, polarization_statistics(stokes, s.map, s.pol_channel) + f"\n  {scale}", legend
 
 
 def polarization_array(loaded: Loaded, s: Settings) -> np.ndarray:
@@ -573,7 +627,7 @@ def spectrum_plot_data(
     channels, _ = base if base is not None else base_channels(loaded, s)
     pick, where = _pick(loaded, pixel)
     radiance = s.quantity == "radiance"
-    n_bars = 3 if s.spectral != "saved" else loaded.reflectance.shape[-1]
+    n_bars = 3 if s.spectral != "saved" and loaded.single_index is None else loaded.reflectance.shape[-1]
     values = channels[pick].reshape(-1, channels.shape[-1]).mean(axis=0)[:n_bars]
     cos_sza_over_pi = np.cos(np.radians(s.sza_deg)) / np.pi
 
@@ -592,7 +646,7 @@ def polarization_plot_data(loaded: Loaded, s: Settings, pixel: tuple[int, int] |
     parameters at every simulated wavelength when the result has them, and of each channel."""
     stokes = channel_stokes(loaded, s)
     pick, where = _pick(loaded, pixel)
-    n_bars = 3 if s.spectral != "saved" else loaded.reflectance.shape[-1]
+    n_bars = 3 if s.spectral != "saved" and loaded.single_index is None else loaded.reflectance.shape[-1]
     dolp_pct = s.plot == "dolp"
 
     def value(stokes_mean):  # (4, n) mean Stokes parameters -> DoLP in % or AoLP in degrees
@@ -801,7 +855,16 @@ def run_window(initial: str | None = None, run: bool = True):
             self.view.clicked.connect(self._pixel_clicked)
 
             right = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-            right.addWidget(self.view)
+            self.legend_figure = Figure(figsize=(6, 0.8), layout=None)
+            self.legend_canvas = FigureCanvasQTAgg(self.legend_figure)
+            self.legend_canvas.setFixedHeight(64)
+            view_box = QtWidgets.QWidget()
+            view_layout = QtWidgets.QVBoxLayout(view_box)
+            view_layout.setContentsMargins(0, 0, 0, 0)
+            view_layout.setSpacing(0)
+            view_layout.addWidget(self.view, 1)
+            view_layout.addWidget(self.legend_canvas)
+            right.addWidget(view_box)
             right.addWidget(self.plot_box)
             right.addWidget(self.stats)
             right.setStretchFactor(0, 3)
@@ -1181,14 +1244,27 @@ def run_window(initial: str | None = None, run: bool = True):
                 return
             if s.map != "image":
                 try:
-                    self.result.image, self.result.text = polarization_image(self.loaded, s)
+                    self.result.image, self.result.text, self.result.legend = polarization_image(self.loaded, s)
                 except Exception as exc:  # no polarization data, or rebuilt channels it cannot make
                     self.say(str(exc))
                     return
             self.say("")
             self.view.show_array(self.result.image)
+            self.draw_legend(self.result.legend)
             self.stats.setPlainText(self.result.text)
             self.update_plot(s)
+
+        def draw_legend(self, legend: Legend | None):
+            """The colour bar under the image: what value each colour or brightness stands for."""
+            fig = self.legend_figure
+            fig.clear()
+            if legend is not None:
+                ax = fig.add_axes((0.04, 0.58, 0.92, 0.32))
+                ax.imshow(legend.ramp[None, :, :], aspect="auto", extent=(legend.low, legend.high, 0, 1), interpolation="nearest")
+                ax.set_yticks([])
+                ax.tick_params(axis="x", labelsize=8)
+                ax.set_xlabel(legend.label, fontsize=8)
+            self.legend_canvas.draw_idle()
 
         def say(self, text: str, ok: bool = False):
             self.message.setStyleSheet("color: #1b5e20;" if ok else "color: #b00020;")
