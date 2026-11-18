@@ -917,14 +917,29 @@ def _clear_sky_toa(ds, name: str) -> np.ndarray:
     return np.asarray(values.values).reshape(values.sizes["Zenith angles"], -1)
 
 
-def _toa_3d(datasets: list) -> np.ndarray:
-    """(n_sensors, n_wavelengths): the TOA reflectance of the 3D runs' datasets, the wavelengths of
-    each run after those of the one before."""
+def _toa_3d(datasets: list, name: str = "I_up (TOA)") -> np.ndarray:
+    """(n_sensors, n_wavelengths): one TOA variable (the reflectance "I_up (TOA)", or a Stokes
+    parameter "Q_up (TOA)", ...) of the 3D runs' datasets, the wavelengths of each run after those
+    of the one before."""
     arrays = []
     for ds in datasets:
-        values = np.asarray(ds["I_up (TOA)"].isel(**{"Azimuth angles": 0, "Zenith angles": 0}).values)
+        values = np.asarray(ds[name].isel(**{"Azimuth angles": 0, "Zenith angles": 0}).values)
         arrays.append(values.reshape(len(values), -1))
     return np.concatenate(arrays, axis=1)
+
+
+def _stokes_3d(datasets: list, spectrum: "Spectrum", height_px: int, width_px: int) -> dict:
+    """The Stokes parameters I, Q, U, V of a 3D render, in the form render_clear_sky() gives its
+    `stokes_out`: {"channels": (4, height, width, n_channels), "spectral": (4, height, width,
+    n_wavelengths)}. SMART-G's backward mode (the 3D one) returns them with its backward-mode
+    sign convention, kept as it is: render_clear_sky() flips the sign of U of its forward-mode run
+    to match. The channel weights are linear, so they apply to each Stokes parameter alike."""
+    stokes_toa = np.stack([_toa_3d(datasets, f"{name}_up (TOA)") for name in "IQUV"])  # (4, pixels, wavelengths)
+    channels = np.stack([spectrum.channels(component) for component in stokes_toa])  # (4, pixels, channels)
+    return {
+        "channels": channels.reshape(4, height_px, width_px, spectrum.n_channels),
+        "spectral": stokes_toa.reshape(4, height_px, width_px, -1),
+    }
 
 
 def render_view(
@@ -947,6 +962,7 @@ def render_view(
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
     spectral_out: dict | None = None,
     environment: Environment | None = None,
+    stokes_out: dict | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """Run one SMART-G 3D radiative-transfer view of the cloud field,
     centred on point_a_km, as seen from satellite_position_km, under a
@@ -973,7 +989,8 @@ def render_view(
     and `grid_step_nm` choose what is simulated, see make_spectrum(); the
     returned reflectance has one band per channel. If `spectral_out` is a dict,
     the reflectance at every simulated wavelength, (height, width, n_wavelengths),
-    is stored in it under "single"."""
+    is stored in it under "single". If `stokes_out` is a dict, the Stokes parameters I, Q, U, V
+    of the view are stored under 0 (see _stokes_3d())."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -1031,10 +1048,13 @@ def render_view(
             **smartg_run_options(environment),
         )
 
-    toa = _toa_3d(_run_parts(spectrum, n_photons, run))  # (pixels, wavelengths)
+    datasets = _run_parts(spectrum, n_photons, run)
+    toa = _toa_3d(datasets)  # (pixels, wavelengths)
     reflectance = spectrum.channels(toa).reshape(height_px, width_px, spectrum.n_channels)
     if spectral_out is not None:
         spectral_out["single"] = toa.reshape(height_px, width_px, -1)
+    if stokes_out is not None:
+        stokes_out[0] = _stokes_3d(datasets, spectrum, height_px, width_px)
     return reflectance, vza_deg, vaa_deg
 
 
@@ -1122,6 +1142,11 @@ def render_clear_sky(
             ],
             axis=2,
         )  # (4, views, wavelengths)
+        # SMART-G's forward mode (this clear-sky run) reports U with the opposite sign to its backward
+        # mode (the 3D cloud run, see _stokes_3d()): the IPRT validation notebook multiplies U of a forward
+        # run by -1 to reconcile them. U is flipped here so that the clear sky and the cloud scenes follow
+        # the backward convention. (Verified on an empty scene: forward U = -backward U, I and Q equal.)
+        stokes_toa[2] = -stokes_toa[2]
         stokes_channels = np.stack([spectrum.channels(component) for component in stokes_toa])  # (4, views, channels)
     results = []
     for index, (vza_deg, vaa_deg) in enumerate(angles):
@@ -1174,6 +1199,7 @@ def render_formation_frozen(
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
     spectral_out: dict | None = None,
     environment: Environment | None = None,
+    stokes_out: dict | None = None,
 ) -> dict[int, np.ndarray]:
     """Render the CloudCT formation's frozen-in-time geometry, exactly as
     main.py defines it (main.formation_positions_km(): satellite index
@@ -1202,7 +1228,8 @@ def render_formation_frozen(
     missing from it point exactly at the target.
 
     Returns {satellite_index: (height_px, width_px, n_wavelengths)
-    reflectance array}, for each index in `satellite_indices`."""
+    reflectance array}, for each index in `satellite_indices`. If `stokes_out` is a dict, the
+    Stokes parameters I, Q, U, V of satellite i are stored under i (see _stokes_3d())."""
     main.ensure_cuda_compatible_msvc_on_path()
     from smartg.smartg import LocalEstimate, Smartg
 
@@ -1262,10 +1289,13 @@ def render_formation_frozen(
                 **smartg_run_options(environment),
             )
 
-        toa = _toa_3d(_run_parts(spectrum, n_photons, run))  # (pixels, wavelengths)
+        datasets = _run_parts(spectrum, n_photons, run)
+        toa = _toa_3d(datasets)  # (pixels, wavelengths)
         images[index] = spectrum.channels(toa).reshape(height_px, width_px, spectrum.n_channels)
         if spectral_out is not None:
             spectral_out[index] = toa.reshape(height_px, width_px, -1)
+        if stokes_out is not None:
+            stokes_out[index] = _stokes_3d(datasets, spectrum, height_px, width_px)
 
     return images
 
@@ -1341,9 +1371,9 @@ class PlaygroundConfig:
     # True: no atmosphere at all (see Environment.no_atmosphere); the aerosol, gas and pressure
     # settings are then ignored. Clear sky only (cloud_source "none"), see validate().
     no_atmosphere: bool = False
-    # Also save the polarization (Stokes I, Q, U, V per channel, DoLP and AoLP): only for
-    # the clear sky (cloud_source "none") so far, see validate().
-    polarization: bool = False
+    # (The polarization, the Stokes parameters I, Q, U, V per channel, is always saved, in the clear sky
+    # and with a cloud: SMART-G computes it anyway. A cloud with the Henyey-Greenstein phase function
+    # is not polarizing, that phase function being a scalar one; the Mie phase function is.)
 
     cloud_source: str = CLOUD_BUNDLED
     bomex_netcdf: str = ""
@@ -1439,8 +1469,6 @@ class PlaygroundConfig:
                 raise ValueError(f"sea_spectrum_file: {exc}") from exc
         if self.no_atmosphere and self.cloud_source != CLOUD_NONE:
             raise ValueError("no_atmosphere is only available for the clear sky (cloud_source 'none'): a cloud needs its atmosphere")
-        if self.polarization and self.cloud_source != CLOUD_NONE:
-            raise ValueError("polarization is only available for the clear sky (cloud_source 'none') so far")
         if not 0.0 <= self.off_nadir_deg <= MAX_OFF_NADIR_DEG:
             raise ValueError(f"off_nadir_deg must be in [0, {MAX_OFF_NADIR_DEG}]")
         if not all(0 <= i < main.NUM_SATELLITES for i in self.satellites_to_render):
@@ -1499,6 +1527,7 @@ class PlaygroundConfig:
             raise ValueError(
                 f"unsupported config version {version!r} (expected {CONFIG_VERSION})"
             )
+        data.pop("polarization", None)  # an older setting: the polarization is always saved now
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(data) - known)
         if unknown:
@@ -1830,7 +1859,7 @@ class PlaygroundSimulation:
         (<name>_polarization.png), and for the "grid" band set <name>_stokes_spectral.npz
         (Stokes at every simulated wavelength, shape (4, 1, 1, n_wavelengths)). Returns
         a line of text with the values, per channel."""
-        if not config.polarization or stokes is None:
+        if stokes is None:
             return ""
         cube = stokes["channels"]
         np.save(png_path.with_name(f"{png_path.stem}_stokes.npy"), cube)
@@ -1896,7 +1925,7 @@ class PlaygroundSimulation:
                 grid_step_nm=config.grid_step_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
-                stokes_out=stokes if config.polarization else None,
+                stokes_out=stokes,
             )
             spectral["single"] = spectral.get(0)
         else:
@@ -1920,6 +1949,7 @@ class PlaygroundSimulation:
                 grid_step_nm=config.grid_step_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
+                stokes_out=stokes,
             )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = OUTPUT_DIR / (
@@ -1996,7 +2026,7 @@ class PlaygroundSimulation:
                 grid_step_nm=config.grid_step_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
-                stokes_out=stokes if config.polarization else None,
+                stokes_out=stokes,
             )
             images = {index: image for index, (image, _, _) in zip(satellite_indices, clear)}
             spectral = {index: spectral[position] for position, index in enumerate(satellite_indices)}
@@ -2022,6 +2052,7 @@ class PlaygroundSimulation:
                 grid_step_nm=config.grid_step_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
+                stokes_out=stokes,
             )
         subdir = OUTPUT_DIR / (
             f"formation_sza{config.sza_deg:.0f}_saa{config.saa_deg:.0f}_"

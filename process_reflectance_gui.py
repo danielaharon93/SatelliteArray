@@ -26,7 +26,7 @@ What can be set (applied top to bottom):
      shows every simulated wavelength, the camera response behind it, and each channel's value
      over the wavelengths it covers; for other band sets only the channels, at their wavelengths.
 
-Polarization. A render made with "Save polarization" (clear sky only) also has <name>_stokes.npy,
+Polarization. A render made with smartg_playground.py or the headless scripts also has <name>_stokes.npy,
 the Stokes parameters I, Q, U, V of every channel (shape (4, height, width, channels)), and, for the
 grid band set, <name>_stokes_spectral.npz (the Stokes parameters at every simulated wavelength). When
 <name>_stokes.npy sits beside the file, group 6 of the window can show the degree of linear
@@ -416,7 +416,7 @@ def process(loaded: Loaded, s: Settings, base: tuple | None = None) -> Result:
 
 NO_POLARIZATION = (
     "this result has no polarization data: <name>_stokes.npy beside the file "
-    "(written when the render was made with 'Save polarization', clear sky only)"
+    "(every render of the current programs writes it; an older render may not have it)"
 )
 
 
@@ -450,7 +450,7 @@ def channel_stokes(loaded: Loaded, s: Settings) -> np.ndarray:
     ):
         raise ValueError(
             "the polarization of rebuilt channels needs <name>_stokes_spectral.npz and <name>_spectral.npz "
-            "(grid band set, with 'Save polarization'): choose 'As simulated'"
+            "(grid or grid_modis band set): choose 'As simulated'"
         )
     weight, total, _ = channel_weights(loaded, response_matrix(loaded, s))
     stokes = loaded.stokes_spectral @ weight / total  # (4, 1 or h, 1 or w, 3)
@@ -1145,7 +1145,7 @@ def run_window(initial: str | None = None, run: bool = True):
             )
             self.info.setText("\n".join(parts))
             self.pol_note.setText(
-                "Needs <name>_stokes.npy (render with 'Save polarization')." if not loaded.has_polarization
+                "Needs <name>_stokes.npy (written by the current renders)." if not loaded.has_polarization
                 else "The map replaces the image above; DoLP and AoLP do not depend on the quantity or the gains."
             )
             self._building = True

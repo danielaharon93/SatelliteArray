@@ -180,7 +180,6 @@ class SmartgPlayground(HasTraits):
     sea_spectrum_file = Str(DEFAULT_SEA_SPECTRUM_FILE)
     matte_offset = Float(0.0)  # water_model "matte": 0 means the clear-sky table (config: None)
     no_atmosphere = Bool(False)  # clear sky only: no air, gases or aerosol at all
-    polarization = Bool(False)  # clear sky only: also save the Stokes parameters, DoLP, AoLP
     bomex_netcdf = Str()
     bomex_browse_button = Button("Browse...")
     extinction_method = Enum(list(EXTINCTION_METHODS))
@@ -364,15 +363,6 @@ class SmartgPlayground(HasTraits):
                         label="Chlorophyll (mg/m3)",
                         tooltip="Chlorophyll concentration of the water; about 0.03-0.1 in clear open ocean",
                         enabled_when="surface == 'ocean' and water_body and water_model == 'chlorophyll'",
-                    ),
-                    Item(
-                        "polarization",
-                        label="Save polarization",
-                        tooltip=(
-                            "Also save the Stokes parameters (I, Q, U, V) of each channel and the degree "
-                            "and angle of linear polarization (DoLP, AoLP). Costs no extra run time"
-                        ),
-                        visible_when="cloud_source == 'none'",
                     ),
                     visible_when="surface == 'ocean'",
                 ),
@@ -845,7 +835,6 @@ class SmartgPlayground(HasTraits):
             water_model=self.water_model,
             sea_spectrum_file=self.sea_spectrum_file,
             matte_offset=self.matte_offset or None,
-            polarization=self.polarization and self.cloud_source == "none",
             no_atmosphere=self.no_atmosphere and self.cloud_source == "none",
             pointing_noise_enabled=self.pointing_noise_enabled,
             yaw_factor=self.yaw_factor,
@@ -890,7 +879,6 @@ class SmartgPlayground(HasTraits):
         self.water_model = config.water_model
         self.sea_spectrum_file = config.sea_spectrum_file
         self.matte_offset = config.matte_offset or 0.0
-        self.polarization = config.polarization
         self.no_atmosphere = config.no_atmosphere
         self.pointing_noise_enabled = config.pointing_noise_enabled
         self.yaw_factor = config.yaw_factor

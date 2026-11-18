@@ -195,6 +195,22 @@ is `reflectance × E0 × cos(sun zenith) / π`, with E0 the channel's response-w
 solar irradiance (at one astronomical unit, no Earth-Sun distance factor). The reflectance
 files are unchanged.
 
+### Polarization
+
+Every image also gets its Stokes parameters I, Q, U, V per channel (`<name>_stokes.npy`, shape
+(4, height, width, channels)), a figure of the degree and angle of linear polarization
+(`<name>_polarization.png`), and for the `grid`, `grid_modis` bands `<name>_stokes_spectral.npz` (the Stokes
+parameters at every simulated wavelength). It is always saved, in the clear sky and with a cloud (there is no setting for it; a
+`"polarization"` entry in an older scenario file is ignored). Costs no extra run time. `process_reflectance_gui.py` plots DoLP and AoLP from these files.
+
+Notes: with a cloud the sea is a flat reflector (the matte model) that does not polarize the light, so the
+polarization comes from the air, the aerosol and the cloud droplets; the droplets polarize only with the Mie phase
+function (`phase_function = "mie"`, the default), not with `"hg"`. SMART-G's forward mode (the clear sky) and
+backward mode (the cloud scenes) report U with opposite signs; the clear-sky U is multiplied by -1 so that both follow
+the backward mode's convention (as SMART-G's IPRT validation notebook does). Q and V are kept as SMART-G gives them. Clear-sky
+`_stokes` files saved before this change have the opposite U (so the opposite AoLP sign); DoLP is not affected.
+The DoLP of a noisy image is biased high (the noise adds to Q and U); use enough photons.
+
 ### Band sets
 
 `band_set` decides what each image channel is.

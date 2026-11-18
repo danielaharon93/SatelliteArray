@@ -44,8 +44,8 @@ BOMEX_FILES: list[str] = []
 
 # The saved scenario to render on each cloud (saved from the GUI with "Save
 # configuration"): satellite geometry, sun, surface, resolution, photons...
-# Its cloud settings are ignored - the settings below replace them - and so are its
-# water body and polarization settings, which a cloud scene does not support.
+# Its cloud settings are ignored - the settings below replace them - and so is its
+# water body setting, which a cloud scene does not support.
 SCENARIO_CONFIG = "configs/scenario.json"
 
 # How the cloud's extinction coefficient is computed from the droplet spectrum:
@@ -120,9 +120,8 @@ def main() -> int:
         print(f"Could not load {config_path}: {exc}", file=sys.stderr)
         return 2
 
-    if base.water_body or base.polarization:
-        print("Note: the scenario's water body and polarization settings are ignored for a cloud scene "
-              "(the sea only reflects).")
+    if base.water_body:
+        print("Note: the scenario's water body setting is ignored for a cloud scene (the sea only reflects).")
 
     datasets = find_datasets()
     if not datasets:
@@ -149,11 +148,9 @@ def main() -> int:
 
             config = dataclasses.replace(
                 base,
-                # the clear-sky settings of a scenario do not apply to a cloud scene: SMART-G's 3D
-                # mode cannot hold the sea's water body, and the polarization is saved for the
-                # clear sky only (the sea then only reflects)
+                # SMART-G's 3D mode cannot hold the sea's water body (the sea then only reflects);
+                # the scenario's polarization setting is kept (the Stokes parameters of the cloud scene)
                 water_body=False,
-                polarization=False,
                 cloud_source=playground_core.CLOUD_BOMEX,
                 bomex_netcdf=str(path),
                 extinction_method=EXTINCTION_METHOD,
