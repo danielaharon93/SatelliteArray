@@ -676,7 +676,7 @@ def draw_spectrum(figure, data: SpectrumData) -> None:
         ax.set_ylim(*data.ylim)
     ax.grid(alpha=0.3)
     if data.wavelength_nm is not None or data.bars:
-        ax.legend(fontsize=8, loc="upper right")
+        ax.legend(fontsize=8, loc="best")
     figure.tight_layout()
 
 
