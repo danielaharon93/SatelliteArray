@@ -9,13 +9,17 @@ same simulation, without rendering again.
 
 What can be set (applied top to bottom):
 
-  1. What the numbers are: reflectance (the sun's spectrum divided out) or radiance
+  1. What the numbers are: reflectance (the sun's spectrum divided out), radiance
      (reflectance x solar irradiance x cos(sun zenith) / pi, in W m-2 um-1 sr-1, the
-     unit of MODIS L1B radiances, so the sun's colour stays in).
+     unit of MODIS L1B radiances, so the sun's colour stays in), or, with the CloudCT camera
+     response, the camera's digital number DN = G_eff x L_eff x exposure time.
   2. How the channels are made. "As simulated": the saved channels. When the render
      was made with the grid band set, <name>_spectral.npz holds the reflectance at every
      simulated wavelength, and the channels can be rebuilt with another camera response:
-     overlapping Gaussian filters, or curves from a CSV file (columns: nm, blue, green, red).
+     overlapping Gaussian filters, curves from a CSV file (columns: nm, blue, green, red),
+     MODIS Terra / Aqua, or the CloudCT camera (configs/cloudct/: one gray channel, whose
+     radiance is the integral L_eff = sum of L(lambda) x eta_hat(lambda) x bin width, in
+     W m-2 sr-1, not divided by the response's area; G_eff = 18.3 DN / (W m-2 sr-1 s)).
   3. Colour: white balance (none, divide out the sun, gray world), per-channel gains,
      normalisation (the chosen percentile becomes 1), a gain, saturation.
   4. Display: highlight handling (clip or roll off) and the tone curve (gamma, sRGB, linear).
@@ -59,8 +63,14 @@ from PIL import Image
 CHANNEL_NAMES = ("blue", "green", "red")  # the order of the arrays' last axis
 LUMINANCE_BGR = np.array([0.0722, 0.7152, 0.2126])  # Rec. 709, in the arrays' B, G, R order
 
-QUANTITIES = ("reflectance", "radiance")
-SPECTRAL_CHOICES = ("saved", "gaussian", "csv", "modis_terra", "modis_aqua")
+QUANTITIES = ("reflectance", "radiance", "dn")
+SPECTRAL_CHOICES = ("saved", "gaussian", "csv", "modis_terra", "modis_aqua", "cloudct")
+# The CloudCT camera's normalised spectral responsivity (one curve: the camera is monochrome); see
+# configs/cloudct/README.md. Its radiance is the integral of L(lambda) x response, in W m-2 sr-1, and its
+# signal in digital numbers is DN = G_eff x that x the exposure time.
+CLOUDCT_RESPONSE_FILE = Path(__file__).with_name("configs") / "cloudct" / "eta_hat_spectral_responsivity.csv"
+CLOUDCT_G_EFF = 18.3  # DN / (W m-2 sr-1 s), from the camera's radiometric calibration
+MW_TO_W = 1e-3  # the solar irradiance is in mW m-2 nm-1
 # The measured MODIS relative spectral responses of bands 3, 4 and 1 (blue, green, red), detector-averaged,
 # from NASA's MODIS Characterization Support Team (see configs/modis_rsr/README.md).
 MODIS_RESPONSE_FILES = {
@@ -257,6 +267,8 @@ class Settings:
     fwhm_nm: tuple = (70.0, 80.0, 90.0)
     response_csv: str = ""  # columns: nm, blue, green, red
     sza_deg: float = 0.0
+    responsivity: float = CLOUDCT_G_EFF  # G_eff, DN / (W m-2 sr-1 s): for quantity "dn"
+    exposure_s: float = 1.0  # the exposure time, for quantity "dn"
     white_balance: str = "none"
     gains: tuple = (1.0, 1.0, 1.0)  # blue, green, red
     normalisation: str = "none"
@@ -284,16 +296,44 @@ def load_response_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     return table[order, 0], table[order, 1:4]
 
 
+def load_cloudct_response() -> tuple[np.ndarray, np.ndarray]:
+    """The CloudCT camera's (wavelength nm, eta_hat) from configs/cloudct/, sorted by wavelength."""
+    table = np.genfromtxt(CLOUDCT_RESPONSE_FILE, delimiter=",", names=True)
+    nm, eta = table["wavelength_nm"], table["eta_hat"]
+    order = np.argsort(nm)
+    return nm[order], eta[order]
+
+
+def cloudct_coverage(loaded: Loaded) -> float:
+    """The share of the CloudCT response (its integral) that lies in the simulated wavelengths: below 1
+    the integrated radiance misses the rest of the camera's band."""
+    nm, eta = load_cloudct_response()
+    whole = float(np.sum(np.diff(nm) * (eta[1:] + eta[:-1]) / 2.0))
+    simulated = float((np.interp(loaded.wavelength_nm, nm, eta, left=0.0, right=0.0) * loaded.bin_width_nm).sum())
+    return simulated / whole
+
+
+def n_made_channels(loaded: Loaded, s: Settings) -> int:
+    """How many channels the options of group 2 make: one for the (monochrome) CloudCT camera, else three,
+    or the saved number for "As simulated" and for a single-channel run."""
+    if s.spectral == "cloudct":
+        return 1
+    return 3 if s.spectral != "saved" and loaded.single_index is None else loaded.reflectance.shape[-1]
+
+
 def response_matrix(loaded: Loaded, s: Settings) -> np.ndarray:
     """(n_wavelengths, 3): the camera's response at each simulated wavelength; (n_wavelengths, 1), that of
-    the one channel, for a single-channel run (see Loaded.single_index)."""
+    the one channel, for a single-channel run (see Loaded.single_index) and for the CloudCT camera."""
     full = _full_response(loaded, s)
     k = loaded.single_index
-    return full if k is None else full[:, [k]]
+    return full if k is None or full.shape[1] == 1 else full[:, [k]]
 
 
 def _full_response(loaded: Loaded, s: Settings) -> np.ndarray:
     lam = loaded.wavelength_nm
+    if s.spectral == "cloudct":
+        nm, eta = load_cloudct_response()
+        return np.interp(lam, nm, eta, left=0.0, right=0.0)[:, None]
     if s.spectral == "gaussian":
         centre, fwhm = np.array(s.centres_nm, float), np.array(s.fwhm_nm, float)
         if (fwhm <= 0).any():
@@ -327,15 +367,38 @@ def channel_weights(loaded: Loaded, response: np.ndarray) -> tuple[np.ndarray, n
     weight = response * loaded.solar[:, None] * dl
     total = weight.sum(axis=0)
     if (total <= 0).any():
-        names = CHANNEL_NAMES if len(total) == 3 else (CHANNEL_NAMES[loaded.single_index],)
+        one = CHANNEL_NAMES[loaded.single_index] if loaded.single_index is not None else "camera"
+        names = CHANNEL_NAMES if len(total) == 3 else (one,)
         empty = [names[k] for k in np.where(total <= 0)[0]]
         raise ValueError(f"the {', '.join(empty)} response is zero over all the simulated wavelengths")
     return weight, total, dl
 
 
-def base_channels(loaded: Loaded, s: Settings) -> tuple[np.ndarray, np.ndarray | None]:
-    """Step 1 and 2: the channels as reflectance or radiance, (h, w, 3) in blue, green, red
-    order, and the channels' mean solar irradiance (None when it is not known)."""
+def quantity_unit(s: Settings) -> str:
+    """The unit of the values base_channels() gives for `s`."""
+    if s.quantity == "reflectance":
+        return "reflectance"
+    if s.quantity == "dn":
+        return "DN"
+    return "W m-2 sr-1" if s.spectral == "cloudct" else "W m-2 um-1 sr-1"
+
+
+def base_channels(loaded: Loaded, s: Settings, integrated: bool = True) -> tuple[np.ndarray, np.ndarray | None]:
+    """Step 1 and 2: the channels as reflectance, radiance or DN, (h, w, 3) in blue, green, red
+    order, and the channels' mean solar irradiance (None when it is not known).
+
+    The CloudCT camera's radiance is the INTEGRAL of L(lambda) x response over the wavelengths, in W m-2 sr-1
+    (the response is normalised to its peak, not to its area), and its DN is G_eff x that x the exposure
+    time; the other responses give the response-weighted MEAN radiance, in W m-2 um-1 sr-1. With
+    `integrated` False the CloudCT camera also gives that mean (the curve the spectrum plot's bars need)."""
+    cloudct = s.spectral == "cloudct"
+    if s.quantity == "dn" and not cloudct:
+        raise ValueError(
+            "DN is the CloudCT camera's signal: choose 'CloudCT camera response' in group 2 "
+            "(it needs the per-wavelength data of the grid band set)"
+        )
+    if s.quantity == "dn" and not (s.responsivity > 0 and s.exposure_s > 0):
+        raise ValueError("the responsivity and the exposure time must be positive")
     if s.spectral == "saved":
         reflectance, irradiance = loaded.reflectance, loaded.irradiance
         if reflectance.shape[-1] == 1:  # a single wavelength: gray
@@ -349,12 +412,15 @@ def base_channels(loaded: Loaded, s: Settings) -> tuple[np.ndarray, np.ndarray |
                 "this result has no <name>_spectral.npz (it holds the reflectance at every wavelength "
                 "and is written only for the grid band set): choose 'As simulated'"
             )
-        reflectance, irradiance = channels_from_wavelengths(loaded, response_matrix(loaded, s))
-        if reflectance.shape[-1] == 1:  # a single-channel run: gray, as for the saved channel
+        response = response_matrix(loaded, s)
+        reflectance, irradiance = channels_from_wavelengths(loaded, response)
+        if cloudct and integrated:  # the irradiance over the response: sum(R E dl), in W m-2
+            irradiance = irradiance * (response * loaded.bin_width_nm[:, None]).sum(axis=0) * MW_TO_W
+        if reflectance.shape[-1] == 1:  # a single-channel run, or the monochrome CloudCT camera: gray
             reflectance, irradiance = np.repeat(reflectance, 3, axis=-1), np.repeat(irradiance, 3)
     if s.quantity == "reflectance":
         return reflectance, irradiance
-    if s.quantity != "radiance":
+    if s.quantity not in ("radiance", "dn"):
         raise ValueError(f"unknown quantity {s.quantity!r}")
     if irradiance is None:
         raise ValueError(
@@ -363,13 +429,16 @@ def base_channels(loaded: Loaded, s: Settings) -> tuple[np.ndarray, np.ndarray |
         )
     if not 0.0 <= s.sza_deg < 90.0:
         raise ValueError("the sun zenith angle must be in [0, 90) degrees for radiance")
-    return reflectance * irradiance * np.cos(np.radians(s.sza_deg)) / np.pi, irradiance
+    radiance = reflectance * irradiance * np.cos(np.radians(s.sza_deg)) / np.pi
+    if s.quantity == "dn":
+        radiance = radiance * s.responsivity * s.exposure_s
+    return radiance, irradiance
 
 
 def to_linear(base: np.ndarray, irradiance: np.ndarray | None, s: Settings) -> np.ndarray:
     """Step 3: white balance, gains, normalisation, gain and saturation. Still linear."""
     x = base.copy()
-    if s.white_balance == "sun" and s.quantity == "radiance" and irradiance is not None:
+    if s.white_balance == "sun" and s.quantity != "reflectance" and irradiance is not None:
         x = x / irradiance * irradiance.mean()  # the sun's colour divided out
     elif s.white_balance == "gray":
         mean = x.reshape(-1, 3).mean(axis=0)
@@ -419,7 +488,7 @@ def image_legend(s: Settings) -> Legend:
     top = 1.0 if s.highlights == "clip" else 4.0
     x = np.linspace(0.0, top, 256)
     ramp = to_display(np.repeat(x[None, :, None], 3, axis=-1), replace(s, view="colour"))[0]
-    unit = "reflectance" if s.quantity == "reflectance" else "W m-2 um-1 sr-1"
+    unit = quantity_unit(s)
     after = ", after the processing" if (s.normalisation == "percentile" or s.gain != 1.0 or s.saturation != 1.0 or s.white_balance != "none") else ""
     where = "" if s.view == "colour" else f" ({s.view} channel)"
     return Legend(ramp, 0.0, top, f"Linear value, {unit}{after}{where}: grey = displayed brightness")
@@ -450,10 +519,18 @@ def process(loaded: Loaded, s: Settings, base: tuple | None = None) -> Result:
     """The whole chain. `base` is the result of base_channels() when the caller already has it."""
     base_values, irradiance = base if base is not None else base_channels(loaded, s)
     linear = to_linear(base_values, irradiance, s)
-    unit = "reflectance" if s.quantity == "reflectance" else "W m-2 um-1 sr-1"
+    unit = quantity_unit(s)
     if s.normalisation == "percentile" or s.gain != 1.0 or s.saturation != 1.0 or s.white_balance != "none":
         unit += ", after the processing"
-    return Result(base_values, linear, to_display(linear, s), statistics(linear, unit), image_legend(s))
+    text = statistics(linear, unit)
+    if s.spectral == "cloudct" and s.quantity != "reflectance" and loaded.has_spectral:
+        text += (
+            "\nCloudCT camera: L_eff = integral of L x eta_hat, in W m-2 sr-1"
+            + (f"; DN = {s.responsivity:g} x L_eff x {s.exposure_s:g} s" if s.quantity == "dn" else "")
+            + f". {100.0 * cloudct_coverage(loaded):.0f} % of the camera's response lies in the simulated wavelengths"
+            + (" (the rest is missing from L_eff)." if cloudct_coverage(loaded) < 0.99 else ".")
+        )
+    return Result(base_values, linear, to_display(linear, s), text, image_legend(s))
 
 
 # ----------------------------------------------------------------------------
@@ -626,9 +703,16 @@ def spectrum_plot_data(
         return polarization_plot_data(loaded, s, pixel)
     channels, _ = base if base is not None else base_channels(loaded, s)
     pick, where = _pick(loaded, pixel)
-    radiance = s.quantity == "radiance"
-    n_bars = 3 if s.spectral != "saved" and loaded.single_index is None else loaded.reflectance.shape[-1]
+    radiance = s.quantity != "reflectance"
+    n_bars = n_made_channels(loaded, s)
     values = channels[pick].reshape(-1, channels.shape[-1]).mean(axis=0)[:n_bars]
+    if s.spectral == "cloudct" and radiance:
+        # The curve is the spectral radiance, so the bar is the response-weighted mean of it (W m-2 um-1 sr-1);
+        # the camera's own L_eff or DN is said in the title.
+        mean_radiance, _ = base_channels(loaded, replace(s, quantity="radiance"), integrated=False)
+        bar = mean_radiance[pick].reshape(-1, 3).mean(axis=0)[:n_bars]
+        where += f"; CloudCT camera: {values[0]:.4g} {quantity_unit(s)}"
+        values = bar
     cos_sza_over_pi = np.cos(np.radians(s.sza_deg)) / np.pi
 
     lam = vals = None
@@ -646,7 +730,7 @@ def polarization_plot_data(loaded: Loaded, s: Settings, pixel: tuple[int, int] |
     parameters at every simulated wavelength when the result has them, and of each channel."""
     stokes = channel_stokes(loaded, s)
     pick, where = _pick(loaded, pixel)
-    n_bars = 3 if s.spectral != "saved" and loaded.single_index is None else loaded.reflectance.shape[-1]
+    n_bars = n_made_channels(loaded, s)
     dolp_pct = s.plot == "dolp"
 
     def value(stokes_mean):  # (4, n) mean Stokes parameters -> DoLP in % or AoLP in degrees
@@ -683,6 +767,8 @@ def _spectrum_layout(loaded, s, n_bars, values, lam, vals, ylabel, where) -> Spe
     if response is None:
         ranges = channel_ranges(loaded) if s.spectral == "saved" else None
     names = CHANNEL_NAMES if n_bars == 3 else (tuple(loaded.channel_labels[:n_bars]) or ("channel",) * n_bars)
+    if s.spectral == "cloudct":
+        names = ("CloudCT camera",)
     colours = CHANNEL_COLOURS if n_bars == 3 else ("black",) * n_bars
     bars = []
     for k in range(n_bars):
@@ -920,12 +1006,22 @@ def run_window(initial: str | None = None, run: bool = True):
                 [
                     ("reflectance", "Reflectance (the sun's spectrum divided out)"),
                     ("radiance", "Radiance (the sun's spectrum kept)"),
+                    ("dn", "Digital number (CloudCT camera: G_eff x L_eff x exposure)"),
                 ],
-                "Radiance = reflectance x solar irradiance x cos(sun zenith) / pi, in W m-2 um-1 sr-1",
+                "Radiance = reflectance x solar irradiance x cos(sun zenith) / pi, in W m-2 um-1 sr-1 (with the "
+                "CloudCT camera response: the integral of L x eta_hat, in W m-2 sr-1). DN needs the CloudCT camera "
+                "response: DN = G_eff x L_eff x exposure time.",
             )
             self.sza = self._spin(0, 89.9, 0, 1, 2, " deg", "Sun zenith angle, for the radiance")
+            self.responsivity = self._spin(
+                0.001, 1e6, CLOUDCT_G_EFF, 1, 3, " DN/(W m-2 sr-1 s)",
+                "The CloudCT camera's radiometric responsivity G_eff, from its radiometric calibration",
+            )
+            self.exposure = self._spin(1e-6, 1e4, Settings.exposure_s, 0.01, 6, " s", "The exposure time the simulation assumes")
             form.addRow("Quantity", self.quantity)
             form.addRow("Sun zenith", self.sza)
+            form.addRow("Responsivity G_eff", self.responsivity)
+            form.addRow("Exposure time", self.exposure)
             return group
 
         def _group_channels(self):
@@ -938,6 +1034,7 @@ def run_window(initial: str | None = None, run: bool = True):
                     ("csv", "Response file (needs the wavelengths)"),
                     ("modis_terra", "MODIS Terra response, b03 b04 b01 (needs the wavelengths)"),
                     ("modis_aqua", "MODIS Aqua response, b03 b04 b01 (needs the wavelengths)"),
+                    ("cloudct", "CloudCT camera response, one gray channel (needs the wavelengths)"),
                 ],
                 "The wavelength options rebuild the channels from <name>_spectral.npz (grid band set only)",
             )
@@ -1107,6 +1204,8 @@ def run_window(initial: str | None = None, run: bool = True):
                 fwhm_nm=tuple(b.value() for b in self.fwhm),
                 response_csv=self.csv_path,
                 sza_deg=self.sza.value(),
+                responsivity=self.responsivity.value(),
+                exposure_s=self.exposure.value(),
                 white_balance=self.white_balance.currentData(),
                 gains=tuple(b.value() for b in self.gains),
                 normalisation=self.normalisation.currentData(),
@@ -1130,8 +1229,10 @@ def run_window(initial: str | None = None, run: bool = True):
             self.csv_button.setEnabled(spectral == "csv")
             self.percentile.setEnabled(self.normalisation.currentData() == "percentile")
             self.gamma.setEnabled(self.tone.currentData() == "gamma")
-            self.sza.setEnabled(self.quantity.currentData() == "radiance")
-            self.white_balance.model().item(1).setEnabled(self.quantity.currentData() == "radiance")
+            self.sza.setEnabled(self.quantity.currentData() != "reflectance")
+            for box in (self.responsivity, self.exposure):
+                box.setEnabled(self.quantity.currentData() == "dn")
+            self.white_balance.model().item(1).setEnabled(self.quantity.currentData() != "reflectance")
             has_polarization = self.loaded is not None and self.loaded.has_polarization
             for box in (self.pol_map, self.pol_channel, self.pol_plot):
                 box.setEnabled(has_polarization)
@@ -1144,10 +1245,12 @@ def run_window(initial: str | None = None, run: bool = True):
             sender = self.sender()
             if sender is self.quantity:  # radiances are far above 1: normalise them, reflectances not
                 self._building = True
-                index = self.normalisation.findData("percentile" if self.quantity.currentData() == "radiance" else "none")
-                self.normalisation.setCurrentIndex(index)
-                if self.quantity.currentData() != "radiance" and self.white_balance.currentData() == "sun":
+                not_reflectance = self.quantity.currentData() != "reflectance"
+                self.normalisation.setCurrentIndex(self.normalisation.findData("percentile" if not_reflectance else "none"))
+                if not not_reflectance and self.white_balance.currentData() == "sun":
                     self.white_balance.setCurrentIndex(0)
+                if self.quantity.currentData() == "dn" and self.loaded is not None and self.loaded.has_spectral:
+                    self.spectral.setCurrentIndex(self.spectral.findData("cloudct"))  # DN is that camera's signal
                 self._building = False
             self._sync_enabled()
             self.refresh()
@@ -1234,7 +1337,7 @@ def run_window(initial: str | None = None, run: bool = True):
                 return
             s = self.settings()
             try:
-                key = (s.quantity, s.spectral, s.centres_nm, s.fwhm_nm, s.response_csv, s.sza_deg)
+                key = (s.quantity, s.spectral, s.centres_nm, s.fwhm_nm, s.response_csv, s.sza_deg, s.responsivity, s.exposure_s)
                 if key != self._cache_key:
                     self._cache, self._cache_key = base_channels(self.loaded, s), key
                 self.result = process(self.loaded, s, self._cache)
