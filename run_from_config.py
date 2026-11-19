@@ -30,7 +30,9 @@ CHANNEL = None
 # (the MODIS Terra channels b03, b04 and b01, simulated as REPTRAN bands) or
 # "grid" (a grid of wavelengths over the camera's range, see grid_range_nm in the
 # scenario file) or "grid_modis" (the three MODIS bands, each in its own SMART-G run on a
-# grid of wavelengths inside that band, see grid_step_nm). None uses the scenario file's own "band_set" setting.
+# grid of wavelengths inside that band, see grid_step_nm), or "grid_cloudct" / "grid_cloudct_support" (the CloudCT
+# camera as one channel, on a grid over its support; photons drawn by its response, or with the response taken as
+# uniform over the support). None uses the scenario file's own "band_set" setting.
 BAND_SET = None
 
 # No display on this kind of machine: keep Traits/Pyface on their no-GUI

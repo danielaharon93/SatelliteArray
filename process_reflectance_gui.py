@@ -54,11 +54,14 @@ no SMART-G.
 import json
 import re
 import sys
+import warnings
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+from cloudct_response import load_cloudct_response  # the CloudCT camera's response (configs/cloudct/)
 
 CHANNEL_NAMES = ("blue", "green", "red")  # the order of the arrays' last axis
 LUMINANCE_BGR = np.array([0.0722, 0.7152, 0.2126])  # Rec. 709, in the arrays' B, G, R order
@@ -68,7 +71,6 @@ SPECTRAL_CHOICES = ("saved", "gaussian", "csv", "modis_terra", "modis_aqua", "cl
 # The CloudCT camera's normalised spectral responsivity (one curve: the camera is monochrome); see
 # configs/cloudct/README.md. Its radiance is the integral of L(lambda) x response, in W m-2 sr-1, and its
 # signal in digital numbers is DN = G_eff x that x the exposure time.
-CLOUDCT_RESPONSE_FILE = Path(__file__).with_name("configs") / "cloudct" / "eta_hat_spectral_responsivity.csv"
 CLOUDCT_G_EFF = 18.3  # DN / (W m-2 sr-1 s), from the camera's radiometric calibration
 MW_TO_W = 1e-3  # the solar irradiance is in mW m-2 nm-1
 # The measured MODIS relative spectral responses of bands 3, 4 and 1 (blue, green, red), detector-averaged,
@@ -122,6 +124,8 @@ class Loaded:
         else None. A rebuilt single channel uses only that channel's camera response."""
         if self.reflectance.shape[-1] != 1:
             return None
+        if "cloudct" in str((self.description or {}).get("band_set", "")):
+            return None  # the CloudCT band sets are one channel of their own, whatever "channel" says
         name = ((self.description or {}).get("scenario") or {}).get("channel")
         if name in CHANNEL_NAMES:
             return CHANNEL_NAMES.index(name)
@@ -296,14 +300,6 @@ def load_response_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     return table[order, 0], table[order, 1:4]
 
 
-def load_cloudct_response() -> tuple[np.ndarray, np.ndarray]:
-    """The CloudCT camera's (wavelength nm, eta_hat) from configs/cloudct/, sorted by wavelength."""
-    table = np.genfromtxt(CLOUDCT_RESPONSE_FILE, delimiter=",", names=True)
-    nm, eta = table["wavelength_nm"], table["eta_hat"]
-    order = np.argsort(nm)
-    return nm[order], eta[order]
-
-
 def cloudct_coverage(loaded: Loaded) -> float:
     """The share of the CloudCT response (its integral) that lies in the simulated wavelengths: below 1
     the integrated radiance misses the rest of the camera's band."""
@@ -356,8 +352,17 @@ def channels_from_wavelengths(loaded: Loaded, response: np.ndarray) -> tuple[np.
     reflectance = sum(R E rho dl) / sum(R E dl), the same definition the simulation uses.
     Also the channels' mean solar irradiance, sum(R E dl) / sum(R dl). Returns (h, w, 3), (3,)."""
     weight, total, dl = channel_weights(loaded, response)
-    reflectance = loaded.spectral @ weight / total
-    return reflectance, total / (response * dl).sum(axis=0)
+    return weighted_channels(loaded.spectral, weight), total / (response * dl).sum(axis=0)
+
+
+def weighted_channels(values: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """sum(value x weight) / sum(weight) over the last axis of `values` (..., n_wavelengths) for each column
+    of `weight` (n_wavelengths, n_channels) -> (..., n_channels). A wavelength that got no photon in a pixel
+    is NaN in the render's data (a very low sampling probability, few photons): it is left out of that
+    pixel's weighted mean."""
+    valid = np.isfinite(values)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(valid, values, 0.0) @ weight / (valid.astype(float) @ weight)
 
 
 def channel_weights(loaded: Loaded, response: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -576,7 +581,7 @@ def channel_stokes(loaded: Loaded, s: Settings) -> np.ndarray:
             "(grid or grid_modis band set): choose 'As simulated'"
         )
     weight, total, _ = channel_weights(loaded, response_matrix(loaded, s))
-    stokes = loaded.stokes_spectral @ weight / total  # (4, 1 or h, 1 or w, 3)
+    stokes = weighted_channels(loaded.stokes_spectral, weight)  # (4, 1 or h, 1 or w, channels)
     if stokes.shape[-1] == 1:  # a single-channel run: gray
         stokes = np.repeat(stokes, 3, axis=-1)
     if stokes.shape[1:3] != loaded.reflectance.shape[:2]:  # the clear sky: one pixel stands for the image
@@ -718,7 +723,9 @@ def spectrum_plot_data(
     lam = vals = None
     if loaded.has_spectral:
         lam = loaded.wavelength_nm
-        vals = loaded.spectral[pick].reshape(-1, len(lam)).mean(axis=0)
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # a wavelength with no photon in any selected pixel stays NaN
+            vals = np.nanmean(loaded.spectral[pick].reshape(-1, len(lam)), axis=0)
         if radiance:
             vals = vals * loaded.solar * cos_sza_over_pi
     ylabel = "Spectral radiance\n(W m-2 um-1 sr-1)" if radiance else "Reflectance"

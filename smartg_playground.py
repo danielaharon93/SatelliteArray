@@ -288,15 +288,19 @@ class SmartgPlayground(HasTraits):
                         "channels b03, b04, b01, simulated as REPTRAN bands; grid: a grid of "
                         "wavelengths over the camera's range, sampled by response x solar irradiance; "
                         "grid_modis: three SMART-G runs, one per MODIS band, each on a grid of wavelengths "
-                        "inside that band only"
+                        "inside that band only; grid_cloudct: the CloudCT camera as ONE channel, a grid over "
+                        "its support (about 588-704 nm), photons drawn in proportion to its response x solar "
+                        "irradiance; grid_cloudct_support: the same wavelengths with the response taken as "
+                        "uniform over the support (to see what the response in the sampling changes)"
                     ),
                 ),
                 Item(
                     "channel",
                     label="Color channel",
+                    enabled_when="band_set not in ('grid_cloudct', 'grid_cloudct_support')",
                     tooltip=(
                         "all: blue, green and red (440, 550, 670 nm); or just one of them, "
-                        "which gives a grayscale image"
+                        "which gives a grayscale image. Not used by the CloudCT band sets (one channel)"
                     ),
                 ),
             ),
@@ -308,10 +312,11 @@ class SmartgPlayground(HasTraits):
                     label="Grid step (nm)",
                     tooltip=(
                         "Bin width of the wavelength grid. grid: the range is split into equal thirds for blue, green and "
-                        "red. grid_modis: the step inside each MODIS band (about 2 nm is a good start; the range is not used)"
+                        "red. grid_modis: the step inside each MODIS band (about 2 nm is a good start; the range is not used). "
+                        "grid_cloudct and grid_cloudct_support: the step over the camera's support (the range is not used)"
                     ),
                 ),
-                visible_when="band_set in ('grid', 'grid_modis')",
+                visible_when="band_set in ('grid', 'grid_modis', 'grid_cloudct', 'grid_cloudct_support')",
             ),
             VGroup(
                 Item("periodic", label="Periodic domain", enabled_when="cloud_source != 'none'"),
