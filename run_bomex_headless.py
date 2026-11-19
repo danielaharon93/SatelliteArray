@@ -8,8 +8,11 @@ hold the droplet spectrum `FNCD`), this script
   2. renders the scenario of a saved config on that cloud with SMART-G
      (same as run_from_config.py, but with the BOMEX cloud).
 
-The droplet phase function is always the Mie one: SMART-G takes it from its
-water-cloud table (clouds/wc_sol.nc), by each voxel's effective radius.
+The cloud's physics comes from the scenario file, like everything else about the scene: how the
+extinction is computed (extinction_method), the crop (bomex_crop_cells) and the droplet phase
+function (phase_function: "mie", SMART-G's water-cloud table clouds/wc_sol.nc by each voxel's
+effective radius, or "hg", Henyey-Greenstein with hg_g). Set them in the GUI and save the
+configuration. This script only chooses the BOMEX files and what it writes.
 
 To use it on another machine, edit only the SETTINGS block below - mainly
 BOMEX_DIR, the folder that holds the BOMEX files - and run:
@@ -43,17 +46,13 @@ BOMEX_PATTERN = "*.com3D_int_2.nc"
 BOMEX_FILES: list[str] = []
 
 # The saved scenario to render on each cloud (saved from the GUI with "Save
-# configuration"): satellite geometry, sun, surface, resolution, photons...
-# Its cloud settings are ignored - the settings below replace them - and so is its
-# water body setting, which a cloud scene does not support.
+# configuration"): satellite geometry, sun, surface, resolution, photons, and the
+# cloud's physics (extinction_method: "q2", the paper's approximation Q = 2, or "mie";
+# bomex_crop_cells: 0 keeps each whole field, otherwise a square of that many cells, at
+# least 16, around the column with the largest optical depth; phase_function and hg_g).
+# Its cloud source and BOMEX file are replaced by the files above - and so is its water
+# body setting, which a cloud scene does not support.
 SCENARIO_CONFIG = "configs/scenario.json"
-
-# How the cloud's extinction coefficient is computed from the droplet spectrum:
-# "q2" (the paper's approximation Q = 2) or "mie" (the Mie Q of each radius bin).
-EXTINCTION_METHOD = "q2"
-# 0 keeps each whole field; otherwise a square of this many cells (at least 16)
-# around the column with the largest optical depth.
-CROP_CELLS = 0
 
 # False: only build the cloud files (no GPU, no SMART-G needed).
 RENDER = True
@@ -77,9 +76,6 @@ SAVE_WAVELENGTH_DISTRIBUTION = True
 GENERATED_CLOUD_DIR = "generated_clouds"
 OUTPUT_DIR = "bomex_runs"
 # =======================================================================
-
-# The droplet phase function. Fixed: SMART-G's Mie phase functions (see above).
-PHASE_FUNCTION = "mie"
 
 here = Path(__file__).parent
 
@@ -131,8 +127,8 @@ def main() -> int:
     playground_core.GENERATED_CLOUD_DIR = resolve(GENERATED_CLOUD_DIR)
     playground_core.SAVE_RADIANCE = SAVE_RADIANCE
     output_root = resolve(OUTPUT_DIR)
-    print(f"{len(datasets)} BOMEX file(s); extinction {EXTINCTION_METHOD}, "
-          f"crop {CROP_CELLS or 'none'}, phase {PHASE_FUNCTION}, render {RENDER}")
+    print(f"{len(datasets)} BOMEX file(s); extinction {base.extinction_method}, "
+          f"crop {base.bomex_crop_cells or 'none'}, phase {base.phase_function}, render {RENDER}")
 
     done, skipped, failed = [], [], []
     for number, path in enumerate(datasets, 1):
@@ -153,9 +149,6 @@ def main() -> int:
                 water_body=False,
                 cloud_source=playground_core.CLOUD_BOMEX,
                 bomex_netcdf=str(path),
-                extinction_method=EXTINCTION_METHOD,
-                bomex_crop_cells=CROP_CELLS,
-                phase_function=PHASE_FUNCTION,
             )
             config.validate()
             if RENDER:
@@ -170,7 +163,7 @@ def main() -> int:
                     print(f"Wavelength distribution: {pdf}")
             else:
                 cloud_file = playground_core.bomex_cloud_file(
-                    path, EXTINCTION_METHOD, CROP_CELLS, on_status=print
+                    path, config.extinction_method, config.bomex_crop_cells, on_status=print
                 )
                 print(f"Cloud file: {cloud_file}")
             done.append(path.name)

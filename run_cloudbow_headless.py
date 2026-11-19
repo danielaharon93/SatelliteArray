@@ -16,9 +16,10 @@ The general formula, which the script also prints for each angle as a check, is
 cos(scattering angle) = -(cos(sza) cos(vza) + sin(sza) sin(vza) cos(saa - vaa)).
 With the sun on the camera's side the sea's sun glint is not in the view.
 
-The cloud (BOMEX files, how the extinction is computed, the crop, the Mie phase function)
-is that of run_bomex_headless.py: its SETTINGS (BOMEX_DIR, BOMEX_PATTERN, BOMEX_FILES,
-SCENARIO_CONFIG, EXTINCTION_METHOD, CROP_CELLS) are used, so they are set in one place.
+The cloud's physics - how the extinction is computed (extinction_method), the crop
+(bomex_crop_cells) and the droplet phase function (phase_function, hg_g) - is the
+scenario's own, from the config file: set it there (in the GUI, "Save configuration").
+This script only chooses which BOMEX files to run and where things go (SETTINGS below).
 The pointing error is switched off here (a curve needs the same view at every angle).
 
 Needs a CUDA GPU and SMART-G's auxiliary data, as run_bomex_headless.py does, unless
@@ -37,6 +38,25 @@ from pathlib import Path
 import numpy as np
 
 # ============================== SETTINGS ==============================
+# Where the BOMEX netCDF files are: the folder, and which files in it (the pattern is searched
+# in the folder only; use "**/*.com3D_int_2.nc" to include its subfolders). Files without the
+# FNCD droplet spectrum are skipped with a message. A relative path is taken relative to this
+# file's folder; an absolute path also works.
+BOMEX_DIR = "/data/bomex"
+BOMEX_PATTERN = "*.com3D_int_2.nc"
+# Or name the files yourself (full paths); when not empty, BOMEX_DIR and BOMEX_PATTERN are ignored.
+BOMEX_FILES: list[str] = []
+
+# The saved scenario to render on each cloud (saved from the GUI with "Save configuration"):
+# the satellite and its view, the surface, the atmosphere, the band set, the resolution, the
+# photons, and the cloud's physics (extinction method, crop, phase function). Its cloud source and
+# BOMEX file settings are replaced by the files above, and so is its water body setting, which a
+# cloud scene does not support.
+SCENARIO_CONFIG = "configs/scenario.json"
+
+# Where the generated cloud files go (one per dataset and setting, reused on later runs).
+GENERATED_CLOUD_DIR = "generated_clouds"
+
 # The scattering angles, in degrees: from START to STOP (included) every STEP.
 ANGLE_START_DEG = 135.0
 ANGLE_STOP_DEG = 150.0
@@ -65,10 +85,35 @@ OUTPUT_DIR = "cloudbow_runs"
 # useful, or well simulated, case).
 MAX_SUN_ZENITH_DEG = 80.0
 
-import run_bomex_headless as bomex  # noqa: E402  (does the no-display setup of run_from_config.py)
+here = Path(__file__).parent
 
-playground_core = bomex.playground_core
+
+def resolve(path: str) -> Path:
+    return (here / path).expanduser()  # an absolute path wins
+
+
+# The no-display setup (Traits backend, SMARTG_DIR_AUXDATA, the import workaround for main.py)
+# lives in run_from_config.py; importing it only does that setup and does not run anything.
+import run_from_config  # noqa: E402
+
+playground_core = run_from_config.playground_core
 main = playground_core.main
+
+
+def find_datasets() -> list[Path]:
+    if BOMEX_FILES:
+        return [resolve(f) for f in BOMEX_FILES]
+    folder = resolve(BOMEX_DIR)
+    if not folder.is_dir():
+        sys.exit(f"BOMEX_DIR {folder} is not a folder: set BOMEX_DIR at the top of {Path(__file__).name}")
+    return sorted(folder.glob(BOMEX_PATTERN))
+
+
+def has_droplet_spectrum(path: Path) -> bool:
+    from netCDF4 import Dataset
+
+    with Dataset(path) as ds:
+        return "FNCD" in ds.variables
 
 
 def scattering_angle_deg(sza_deg: float, saa_deg: float, vza_deg: float, vaa_deg: float) -> float:
@@ -174,9 +219,6 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
         water_body=False,
         cloud_source=playground_core.CLOUD_BOMEX,
         bomex_netcdf=str(path),
-        extinction_method=bomex.EXTINCTION_METHOD,
-        bomex_crop_cells=bomex.CROP_CELLS,
-        phase_function=bomex.PHASE_FUNCTION,
         pointing_noise_enabled=False,  # a curve needs the same view at every angle
         renders=1,
         **({"resolution": RESOLUTION} if RESOLUTION is not None else {}),
@@ -191,6 +233,9 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
             "(a formation has a different view, so a different scattering angle, per satellite)"
         )
 
+    print(f"Cloud (from the scenario): extinction {config.extinction_method}, "
+          f"crop {config.bomex_crop_cells or 'none'}, phase function {config.phase_function}"
+          + (f" (g = {config.hg_g})" if config.phase_function == playground_core.cloud_microphysics.PHASE_HG else ""))
     simulation = playground_core.PlaygroundSimulation.from_config(config)
     cloud = playground_core.resolve_cloud(config, print)  # builds the cloud file when needed
     point_a_km = simulation.point_a_km(config.off_nadir_deg, config.view_azimuth_deg)
@@ -241,7 +286,7 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
 
 
 def main_script() -> int:
-    config_path = bomex.resolve(bomex.SCENARIO_CONFIG)
+    config_path = resolve(SCENARIO_CONFIG)
     try:
         base = playground_core.PlaygroundConfig.load(config_path, require_dataset=False)
     except (OSError, ValueError) as exc:
@@ -251,14 +296,14 @@ def main_script() -> int:
         print(f"RESOLUTION must be one of {list(playground_core.RESOLUTION_PRESETS)}", file=sys.stderr)
         return 2
 
-    datasets = bomex.find_datasets()
+    datasets = find_datasets()
     if not datasets:
-        print("No BOMEX files found (see BOMEX_DIR in run_bomex_headless.py).", file=sys.stderr)
+        print("No BOMEX files found (see BOMEX_DIR at the top of this file).", file=sys.stderr)
         return 2
 
-    playground_core.GENERATED_CLOUD_DIR = bomex.resolve(bomex.GENERATED_CLOUD_DIR)
+    playground_core.GENERATED_CLOUD_DIR = resolve(GENERATED_CLOUD_DIR)
     playground_core.SAVE_RADIANCE = False
-    output_root = bomex.resolve(OUTPUT_DIR)
+    output_root = resolve(OUTPUT_DIR)
     theta_list = angles()
     print(f"{len(datasets)} BOMEX file(s); {len(theta_list)} scattering angles "
           f"({theta_list[0]:g} to {theta_list[-1]:g} deg)")
@@ -269,7 +314,7 @@ def main_script() -> int:
         try:
             if not path.is_file():
                 raise FileNotFoundError(f"{path} does not exist")
-            if not bomex.has_droplet_spectrum(path):
+            if not has_droplet_spectrum(path):
                 print("No FNCD droplet spectrum in this file: skipped.")
                 skipped.append(path.name)
                 continue

@@ -172,9 +172,12 @@ with no GUI. Edit the SETTINGS block at the top (mainly `BOMEX_DIR`, the folder 
 holds the files) and run `python run_bomex_headless.py`. For each file with an `FNCD`
 spectrum it builds the cloud file and renders the scenario of `SCENARIO_CONFIG` on it,
 writing the images to `bomex_runs/<dataset name>/`. Files without `FNCD` are skipped, a
-failing file does not stop the others, and the exit code is 1 if any failed. The phase
-function is always SMART-G's Mie one. With `RENDER = False` it only builds the cloud
-files, which needs no GPU.
+failing file does not stop the others, and the exit code is 1 if any failed. The cloud's
+physics (`extinction_method`, `bomex_crop_cells`, `phase_function`, `hg_g`) is the
+scenario's own, like the rest of the scene: set it in the config, not in the script
+(the script replaces only `cloud_source` and `bomex_netcdf`, and `water_body`, which a
+cloud scene does not support). With `RENDER = False` it only builds the cloud files,
+which needs no GPU.
 
 With `SAVE_WAVELENGTH_DISTRIBUTION = True` (the default) each dataset's folder also gets
 `wavelength_distribution.pdf`: the probability with which SMART-G draws each photon's
