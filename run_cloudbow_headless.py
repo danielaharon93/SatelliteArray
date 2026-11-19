@@ -4,7 +4,10 @@ The cloudbow (the cloud's version of a rainbow) sits at scattering angles of abo
 135-150 degrees, and shows most clearly in the polarization. This script renders the
 scenario of a saved config (the satellite, its view, the surface, the atmosphere, the
 band set, the resolution, the photons...) on each BOMEX cloud once per scattering angle,
-and plots the degree of linear polarization (DoLP) of the image against that angle in a PDF.
+and plots the degree of linear polarization (DoLP) against that angle in a PDF. The DoLP is
+that of a small patch of pixels (PATCH_SIZE_PX, 3x3 by default) that look at thick cloud: the
+block whose thinnest pixel has the largest optical depth along its line of sight. The sea's
+pixels are not part of it.
 
 The satellite's view is fixed by the scenario, so the scattering angle is changed by moving
 the SUN, in the vertical plane of the view (the sun's azimuth is the camera's), at the
@@ -76,6 +79,15 @@ GRID_STEP_NM: float | None = None
 # no GPU and no SMART-G).
 PLAN_ONLY = False
 
+# The DoLP is taken from a small patch of pixels that look at thick cloud, not from the whole image
+# (whose sea pixels would dilute it). The patch is the PATCH_SIZE_PX x PATCH_SIZE_PX block (an odd
+# number; 1 is a single pixel) whose thinnest pixel has the largest optical depth along its line of
+# sight; the DoLP is that of the patch's mean Stokes parameters. It is the same block at every angle
+# (only the sun moves). The run stops if even the best block has an optical depth below
+# MIN_PATCH_OPTICAL_DEPTH in some pixel (the line of sight may then reach the sea).
+PATCH_SIZE_PX = 3
+MIN_PATCH_OPTICAL_DEPTH = 5.0
+
 # One folder per dataset, in it one folder per angle (the images, as in run_bomex_headless.py),
 # and cloudbow_dolp.pdf and cloudbow_dolp.csv.
 OUTPUT_DIR = "cloudbow_runs"
@@ -140,37 +152,100 @@ def angles() -> list[float]:
     return [float(ANGLE_START_DEG + k * ANGLE_STEP_DEG) for k in range(n)]
 
 
-def polarization_of(stokes: np.ndarray) -> dict:
+def pixel_optical_depths(
+    dat_path: Path, width_px: int, height_px: int, vza_deg: float, vaa_deg: float,
+    target_height_km: float, periodic: bool,
+) -> np.ndarray:
+    """(height_px, width_px) optical depth along each pixel's line of sight through the cloud file.
+    The pixels are laid out as in playground_core.footprint_sensors(): points on a regular grid
+    over the field, all looking along one direction, the lines of sight crossing the field's
+    centre at `target_height_km` (the same geometry as playground_core.pixel_voxel_statistics()).
+    The extinction is the cloud file's, at its reference wavelength."""
+    from smartg.atmosphere import read_i3rc_cloud
+
+    field = read_i3rc_cloud(dat_path)
+    ext = field["ext"].values  # (nz, ny, nx), 1/km
+    xb, yb, zb = (np.asarray(field[name].values, dtype=float) for name in ("x_bounds", "y_bounds", "z_bounds"))
+    nz, ny, nx = ext.shape
+    layers = np.flatnonzero((ext > 0).any(axis=(1, 2)))
+    if layers.size == 0:
+        raise ValueError("the cloud has no cloudy voxel")
+    z_lo, z_hi = float(zb[layers[0]]), float(zb[layers[-1] + 1])
+
+    theta, travel = np.radians(vza_deg), np.radians((vaa_deg + 180.0) % 360.0)
+    shift_x, shift_y = np.tan(theta) * np.cos(travel), np.tan(theta) * np.sin(travel)  # km per km of descent
+    x0, x1, y0, y1 = xb[0], xb[-1], yb[0], yb[-1]
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    pitch_x, pitch_y = (x1 - x0) / width_px, (y1 - y0) / height_px
+    px, py = np.meshgrid(
+        x0 + (np.arange(width_px) + 0.5) * pitch_x - cx, y0 + (np.arange(height_px) + 0.5) * pitch_y - cy
+    )
+
+    step_km = 0.25 * float(np.diff(zb[layers[0] : layers[-1] + 2]).min())
+    heights = z_hi - (np.arange(int(np.ceil((z_hi - z_lo) / step_km))) + 0.5) * step_km
+    path_km = step_km / np.cos(theta)  # length of the line of sight in each height step
+    depth = np.zeros(px.shape)
+    for height in heights:
+        x = cx + px + (target_height_km - height) * shift_x
+        y = cy + py + (target_height_km - height) * shift_y
+        if periodic:
+            x = x0 + (x - x0) % (x1 - x0)
+            y = y0 + (y - y0) % (y1 - y0)
+        ix = np.searchsorted(xb, x, side="right") - 1
+        iy = np.searchsorted(yb, y, side="right") - 1
+        iz = int(np.searchsorted(zb, height, side="right")) - 1
+        inside = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+        depth += np.where(inside, ext[iz, np.clip(iy, 0, ny - 1), np.clip(ix, 0, nx - 1)], 0.0) * path_km
+    return depth
+
+
+def choose_patch(depth: np.ndarray, size: int) -> tuple[int, int, float]:
+    """The size x size block of pixels (top row, left column) whose thinnest pixel has the largest
+    optical depth - so that every pixel of the block looks at thick cloud - and that thinnest
+    optical depth."""
+    if size < 1 or size % 2 == 0:
+        raise ValueError(f"PATCH_SIZE_PX must be an odd number, 1 or more (it is {size})")
+    height, width = depth.shape
+    if size > min(height, width):
+        raise ValueError(f"PATCH_SIZE_PX {size} is larger than the image ({width}x{height})")
+    thinnest = np.min(
+        [depth[r : height - size + 1 + r, c : width - size + 1 + c] for r in range(size) for c in range(size)],
+        axis=0,
+    )
+    row, col = np.unravel_index(np.argmax(thinnest), thinnest.shape)
+    return int(row), int(col), float(thinnest[row, col])
+
+
+def polarization_of(stokes: np.ndarray, row: int, col: int, size: int) -> dict:
     """(4, h, w, n_channels) Stokes parameters -> per channel the mean Stokes parameters over the
-    image, the DoLP of those means (the intensity-weighted one: bright cloud pixels count most, and
-    the noise of single pixels, which biases a pixel's DoLP high, averages out), the median of the
-    pixels' own DoLPs, and the AoLP of the mean."""
-    mean = stokes.reshape(4, -1, stokes.shape[-1]).mean(axis=1)  # (4, n_channels)
+    size x size patch of pixels whose top left pixel is (row, col), the DoLP of those means (the
+    noise of single pixels, which biases a pixel's own DoLP high, averages out) and their AoLP."""
+    patch = stokes[:, row : row + size, col : col + size, :]
+    mean = patch.reshape(4, -1, stokes.shape[-1]).mean(axis=1)  # (4, n_channels)
     dolp, aolp = playground_core.stokes_to_polarization(mean)
-    pixel_dolp, _ = playground_core.stokes_to_polarization(stokes)
-    return {
-        "stokes_mean": mean,
-        "dolp": np.asarray(dolp),
-        "aolp": np.asarray(aolp),
-        "dolp_pixel_median": np.median(pixel_dolp.reshape(-1, stokes.shape[-1]), axis=0),
-    }
+    return {"stokes_mean": mean, "dolp": np.asarray(dolp), "aolp": np.asarray(aolp)}
 
 
-def write_outputs(folder: Path, dataset: str, labels: tuple, rows: list[dict], view: tuple, config) -> None:
-    """cloudbow_dolp.csv (one line per angle and channel) and cloudbow_dolp.pdf."""
+def write_outputs(
+    folder: Path, dataset: str, labels: tuple, rows: list[dict], view: tuple, config, patch: tuple
+) -> None:
+    """cloudbow_dolp.csv (one line per angle and channel) and cloudbow_dolp.pdf. `patch` is
+    (top row, left column, size, thinnest optical depth)."""
+    patch_row, patch_col, size, patch_depth = patch
     with (folder / "cloudbow_dolp.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             ["scattering_angle_deg", "sun_zenith_deg", "sun_azimuth_deg", "channel", "I", "Q", "U", "V",
-             "dolp_percent", "dolp_percent_pixel_median", "aolp_deg"]
+             "dolp_percent", "aolp_deg", "patch_top_row", "patch_left_column", "patch_size_px",
+             "patch_min_optical_depth"]
         )
         for row in rows:
             for k, label in enumerate(labels):
                 s = row["stokes_mean"][:, k]
                 writer.writerow(
                     [f"{row['theta']:.3f}", f"{row['sza']:.3f}", f"{row['saa']:.3f}", label,
-                     *(f"{v:.6g}" for v in s), f"{100 * row['dolp'][k]:.4f}",
-                     f"{100 * row['dolp_pixel_median'][k]:.4f}", f"{row['aolp'][k]:.2f}"]
+                     *(f"{v:.6g}" for v in s), f"{100 * row['dolp'][k]:.4f}", f"{row['aolp'][k]:.2f}",
+                     patch_row, patch_col, size, f"{patch_depth:.2f}"]
                 )
 
     import matplotlib
@@ -189,7 +264,7 @@ def write_outputs(folder: Path, dataset: str, labels: tuple, rows: list[dict], v
         values = 100 * np.array([row["dolp"][k] for row in rows])
         axis.plot(theta, values, "o-", color=line_colours[k], label=label)
     axis.set_xlabel("Scattering angle (deg)")
-    axis.set_ylabel("DoLP of the image (%)")
+    axis.set_ylabel("DoLP of the cloud patch (%)")
     axis.set_ylim(bottom=0)
     axis.grid(alpha=0.3)
     axis.legend(fontsize=8, loc="best")
@@ -204,7 +279,8 @@ def write_outputs(folder: Path, dataset: str, labels: tuple, rows: list[dict], v
     )
     figure.text(
         0.5, 0.005,
-        "DoLP = sqrt(Q^2 + U^2) / I of the image's mean Stokes parameters (bright pixels count most).",
+        f"DoLP = sqrt(Q^2 + U^2) / I of the mean Stokes parameters of a {size}x{size} pixel patch "
+        f"(row {patch_row}, column {patch_col}) whose lines of sight all cross cloud of optical depth >= {patch_depth:.1f}.",
         ha="center", fontsize=7,
     )
     figure.tight_layout(rect=(0, 0.03, 1, 0.97))
@@ -256,6 +332,22 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
             raise AssertionError(f"scattering angle {check} instead of {theta}")
         plan.append((theta, sza, saa))
         print(f"  scattering angle {theta:6.2f} deg: sun zenith {sza:6.2f}, azimuth {saa:6.2f} deg")
+
+    width_px, height_px = playground_core.RESOLUTION_PRESETS[config.resolution]
+    depth = pixel_optical_depths(
+        cloud.dat_path, width_px, height_px, vza, vaa, cloud.center_height_km, config.periodic
+    )
+    patch_row, patch_col, patch_depth = choose_patch(depth, PATCH_SIZE_PX)
+    print(f"Patch of {PATCH_SIZE_PX}x{PATCH_SIZE_PX} pixels at row {patch_row}, column {patch_col}: "
+          f"optical depth along its lines of sight at least {patch_depth:.1f} "
+          f"(the image's largest: {depth.max():.1f}; {100 * np.mean(depth >= MIN_PATCH_OPTICAL_DEPTH):.0f} % "
+          f"of the pixels reach {MIN_PATCH_OPTICAL_DEPTH:g})")
+    if patch_depth < MIN_PATCH_OPTICAL_DEPTH:
+        raise ValueError(
+            f"even the best {PATCH_SIZE_PX}x{PATCH_SIZE_PX} patch has a pixel of optical depth {patch_depth:.1f}, "
+            f"below MIN_PATCH_OPTICAL_DEPTH ({MIN_PATCH_OPTICAL_DEPTH:g}): lower it or use a smaller patch"
+        )
+    patch = (patch_row, patch_col, PATCH_SIZE_PX, patch_depth)
     if PLAN_ONLY:
         return
 
@@ -278,10 +370,10 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
         simulation.render(dataclasses.replace(config, sza_deg=sza, saa_deg=saa), on_status=print)
         [stokes_file] = playground_core.OUTPUT_DIR.glob("*_stokes.npy")
         stokes = np.load(stokes_file)
-        rows.append({"theta": theta, "sza": sza, "saa": saa, **polarization_of(stokes)})
+        rows.append({"theta": theta, "sza": sza, "saa": saa, **polarization_of(stokes, patch_row, patch_col, PATCH_SIZE_PX)})
         print("  DoLP " + ", ".join(f"{label}: {100 * d:.2f} %" for label, d in zip(labels, rows[-1]["dolp"]))
               + f"   ({time.time() - started:.0f} s)")
-        write_outputs(folder, path.name.split(".")[0], labels, rows, (vza, vaa), config)  # after each angle
+        write_outputs(folder, path.name.split(".")[0], labels, rows, (vza, vaa), config, patch)  # after each angle
     print(f"PDF: {folder / 'cloudbow_dolp.pdf'}")
 
 
