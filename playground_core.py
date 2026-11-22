@@ -186,7 +186,16 @@ BAND_SET_GRID_MODIS = "grid_modis"
 # the same estimator from either, with a different noise. The "channel" setting is not used.
 BAND_SET_GRID_CLOUDCT = "grid_cloudct"
 BAND_SET_GRID_CLOUDCT_SUPPORT = "grid_cloudct_support"
-CLOUDCT_BAND_SETS = (BAND_SET_GRID_CLOUDCT, BAND_SET_GRID_CLOUDCT_SUPPORT)
+# The same two, as REPTRAN bands (SMART-G's correlated-k gas absorption, which single wavelengths lack: the
+# O2 B band near 688 nm lies inside the camera's band): the internal bands of SMART-G's coarse solar REPTRAN
+# file inside the support, each weighted by response x solar irradiance x its share of its band's width.
+# Many more wavelengths than a coarse grid (about 240), so slower; the photons' wavelengths are drawn in
+# proportion to the same weights (`reptran_cloudct`) or with the response taken as uniform.
+BAND_SET_REPTRAN_CLOUDCT = "reptran_cloudct"
+BAND_SET_REPTRAN_CLOUDCT_SUPPORT = "reptran_cloudct_support"
+CLOUDCT_BAND_SETS = (
+    BAND_SET_GRID_CLOUDCT, BAND_SET_GRID_CLOUDCT_SUPPORT, BAND_SET_REPTRAN_CLOUDCT, BAND_SET_REPTRAN_CLOUDCT_SUPPORT,
+)
 BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS, BAND_SET_GRID, BAND_SET_GRID_MODIS, *CLOUDCT_BAND_SETS)
 # The band sets with a wavelength grid: the per-wavelength reflectance (and Stokes parameters) are saved.
 SPECTRAL_BAND_SETS = (BAND_SET_GRID, BAND_SET_GRID_MODIS, *CLOUDCT_BAND_SETS)
@@ -257,6 +266,12 @@ class Spectrum:
     parts: tuple | None = None
     # Said under the wavelength-distribution figure, when the default text does not describe the sampling.
     sampling_note: str = ""
+
+    @property
+    def wavelengths_nm(self) -> np.ndarray:
+        """The simulated wavelengths (nm) as an array: `run_wavelength`, or for REPTRAN bands the
+        representative wavelength of each internal band."""
+        return self.representative_nm if self.representative_nm is not None else np.asarray(self.run_wavelength, float)
 
     @property
     def runs(self) -> tuple:
@@ -348,8 +363,10 @@ def make_spectrum(
     set (pass it as a tuple); `grid_step_nm` for the grid band sets."""
     if channel not in CHANNELS:
         raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
-    if band_set in CLOUDCT_BAND_SETS:
+    if band_set in (BAND_SET_GRID_CLOUDCT, BAND_SET_GRID_CLOUDCT_SUPPORT):
         return _grid_cloudct_spectrum(float(grid_step_nm), weighted=band_set == BAND_SET_GRID_CLOUDCT)
+    if band_set in (BAND_SET_REPTRAN_CLOUDCT, BAND_SET_REPTRAN_CLOUDCT_SUPPORT):
+        return _reptran_cloudct_spectrum(weighted=band_set == BAND_SET_REPTRAN_CLOUDCT)
     if band_set == BAND_SET_RGB:
         wavelengths = channel_wavelengths_nm(channel)
         return Spectrum(
@@ -492,6 +509,66 @@ def _grid_cloudct_spectrum(grid_step_nm: float, weighted: bool) -> Spectrum:
         width,
         reff_acc=GRID_REFF_ACC,
         channel_irradiance=np.array([weight.sum() / (weight / irradiance).sum()]),
+        sampling_note=note,
+    )
+
+
+def _reptran_cloudct_spectrum(weighted: bool) -> Spectrum:
+    """The "reptran_cloudct" (`weighted`) and "reptran_cloudct_support" band sets: the CloudCT camera as one
+    channel of REPTRAN internal bands. The bands are those of SMART-G's coarse solar REPTRAN file
+    (SOLAR_REPTRAN_FILE) over the camera's support (cloudct_response.support_nm()); SMART-G treats the gas
+    absorption of each internal band by the correlated-k method. An internal band stands for the fraction
+    `weight` (the quadrature weight) of its band's width, so it gets
+        w = response x solar irradiance (`extra`) x band width x weight,
+    the response being the camera's curve at the band's centre (`weighted`) or 1. The channel is
+    sum(w x reflectance) / sum(w), and the photons' wavelengths are drawn in proportion to w, as in the grid
+    band sets. The saved per-wavelength data use the internal bands' representative wavelengths, with
+    `bin_width` = band width x weight and `solar` = extra, so the processing tool's
+    response x solar x bin width is the same w."""
+    import cloudct_response
+    from smartg.bandset import BandSet
+    from smartg.cdf import icdf
+    from smartg.reptran import Reptran
+
+    low, high = cloudct_response.support_nm()
+    internal = Reptran(SOLAR_REPTRAN_FILE).to_smartg(lmin=low, lmax=high).l  # sorted by representative wavelength
+    if not internal:
+        raise ValueError(f"no REPTRAN internal band between {low:g} and {high:g} nm")
+    centre = np.array([0.5 * (float(i.band.wmin) + float(i.band.wmax)) for i in internal])
+    band_width = np.array([float(i.band.wmax) - float(i.band.wmin) for i in internal])
+    quadrature = np.array([float(i.weight) for i in internal])
+    extra = np.array([float(i.extra) for i in internal])
+    representative = np.array([float(i.w) for i in internal])
+    bin_width = band_width * quadrature
+    if weighted:
+        nm, eta = cloudct_response.load_cloudct_response()
+        response = np.interp(centre, nm, eta, left=0.0, right=0.0)
+        label = f"CloudCT camera {low:.0f}-{high:.0f} nm (REPTRAN)"
+        note = (
+            "One channel (the CloudCT camera, REPTRAN internal bands): all the photons are shared in proportion to\n"
+            "the camera's response x irradiance x band width x quadrature weight"
+        )
+    else:
+        response = np.ones_like(centre)
+        label = f"CloudCT support {low:.0f}-{high:.0f} nm, uniform response (REPTRAN)"
+        note = (
+            "One channel (the CloudCT camera's support, response taken as uniform, REPTRAN internal bands): all the\n"
+            "photons are shared in proportion to irradiance x band width x quadrature weight"
+        )
+    weight = response * extra * bin_width
+    share = weight / weight.sum()
+    return Spectrum(
+        (label,),
+        BandSet(internal),
+        np.zeros(len(internal), dtype=int),
+        weight,
+        icdf(share).astype(np.int64),
+        share,
+        extra,
+        bin_width,
+        reff_acc=GRID_REFF_ACC,
+        channel_irradiance=np.array([weight.sum() / (weight / extra).sum()]),
+        representative_nm=representative,
         sampling_note=note,
     )
 
@@ -1862,7 +1939,7 @@ class PlaygroundSimulation:
         np.savez_compressed(
             png_path.with_name(f"{png_path.stem}_spectral.npz"),
             reflectance=cube.astype(np.float32),
-            wavelength_nm=spectrum.run_wavelength,
+            wavelength_nm=spectrum.wavelengths_nm,
             sampling_probability=spectrum.sampling,
             channel_weight=spectrum.weight,
             channel_of_wavelength=spectrum.group,
@@ -1941,7 +2018,7 @@ class PlaygroundSimulation:
             np.savez_compressed(
                 png_path.with_name(f"{png_path.stem}_stokes_spectral.npz"),
                 stokes=stokes["spectral"].astype(np.float32),
-                wavelength_nm=config_spectrum(config).run_wavelength,
+                wavelength_nm=config_spectrum(config).wavelengths_nm,
             )
         dolp, aolp = stokes_to_polarization(cube)
         center = (cube.shape[1] // 2, cube.shape[2] // 2)
@@ -2449,7 +2526,7 @@ def save_wavelength_distribution_figure(spectrum: Spectrum, path: Path, title: s
         figure.savefig(path, format=file_format)
         return
 
-    wavelength = np.asarray(spectrum.run_wavelength, float)
+    wavelength = spectrum.wavelengths_nm
     figure = Figure(figsize=(8.0, 6.0), layout="constrained")
     FigureCanvasAgg(figure)
     top, bottom = figure.subplots(2, 1, sharex=True)
@@ -2510,9 +2587,14 @@ def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> 
         log(f"Grid: {len(spectrum.run_wavelength)} wavelengths between {config.grid_range_nm[0]:g} and "
             f"{config.grid_range_nm[1]:g} nm, photons drawn in proportion to response x solar irradiance")
     if config.band_set in CLOUDCT_BAND_SETS:
-        log(f"CloudCT camera as one channel: {len(spectrum.run_wavelength)} wavelengths over its support "
-            f"({spectrum.run_wavelength.min():.0f}-{spectrum.run_wavelength.max():.0f} nm), photons drawn in proportion to "
-            + ("the camera's response" if config.band_set == BAND_SET_GRID_CLOUDCT else "a uniform response over the support")
+        wavelengths = spectrum.wavelengths_nm
+        log(f"CloudCT camera as one channel: {len(wavelengths)} wavelengths over its support "
+            f"({wavelengths.min():.0f}-{wavelengths.max():.0f} nm), photons drawn in proportion to "
+            + (
+                "the camera's response"
+                if config.band_set in (BAND_SET_GRID_CLOUDCT, BAND_SET_REPTRAN_CLOUDCT)
+                else "a uniform response over the support"
+            )
             + " x solar irradiance x bin width")
     if config.band_set == BAND_SET_GRID_MODIS:
         counts =", ".join(f"{len(part.run_wavelength)} in {part.labels[0]}" for part in spectrum.runs)

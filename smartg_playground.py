@@ -291,13 +291,19 @@ class SmartgPlayground(HasTraits):
                         "inside that band only; grid_cloudct: the CloudCT camera as ONE channel, a grid over "
                         "its support (about 588-704 nm), photons drawn in proportion to its response x solar "
                         "irradiance; grid_cloudct_support: the same wavelengths with the response taken as "
-                        "uniform over the support (to see what the response in the sampling changes)"
+                        "uniform over the support (to see what the response in the sampling changes); "
+                        "reptran_cloudct and reptran_cloudct_support: the same two as REPTRAN internal bands "
+                        "(about 240, so slower), which include the gas absorption lines (e.g. the O2 B band) "
+                        "that single wavelengths lack"
                     ),
                 ),
                 Item(
                     "channel",
                     label="Color channel",
-                    enabled_when="band_set not in ('grid_cloudct', 'grid_cloudct_support')",
+                    enabled_when=(
+                        "band_set not in ('grid_cloudct', 'grid_cloudct_support', "
+                        "'reptran_cloudct', 'reptran_cloudct_support')"
+                    ),
                     tooltip=(
                         "all: blue, green and red (440, 550, 670 nm); or just one of them, "
                         "which gives a grayscale image. Not used by the CloudCT band sets (one channel)"

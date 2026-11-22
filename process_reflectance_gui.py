@@ -155,7 +155,7 @@ def name_band_info(path: Path) -> tuple[str | None, int | None]:
     text = f"{path.parent.name}/{path.name}" if path.stem.startswith("satellite_") else path.name
     single = re.search(r"_(blue|green|red)(?=_noise|/|\.|$)", text)
     index = ["blue", "green", "red"].index(single.group(1)) if single else None
-    if "_grid" in text:
+    if "_grid" in text or "_cloudct" in text:
         return None, index
     return ("modis" if "_modis" in text else "rgb"), index
 
