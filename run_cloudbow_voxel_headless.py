@@ -22,7 +22,7 @@ changed by moving the SUN in the vertical plane of the view:
 
 and everything else - the satellite, the surface, the atmosphere, the resolution, the photons, the
 extinction method and the phase function - is the scenario's own (configs/scenario.json). The exception
-is the wavelength: BAND_SET and CHANNEL below select ONE wavelength (see there for why).
+is the wavelength: BAND_SET (and WAVELENGTH_NM) below select ONE wavelength (see there for why).
 
 The plot also shows the SINGLE-SCATTERING polarization of the same droplets, |F12| / F11 of SMART-G's
 water-cloud table (clouds/wc_sol.nc) at the voxel's effective radius and the band's wavelengths: where
@@ -89,10 +89,12 @@ PHOTONS_PER_PIXEL: float | None = None
 # The wavelengths. IMPORTANT: in the tests made for this script, a SMART-G run with MORE THAN ONE
 # wavelength gave the voxel the same result with the Mie and the Henyey-Greenstein phase function (no
 # bow, and the DoLP 5 % instead of 31 % at 142 deg), while a run with ONE wavelength gave the bow; so
-# this script uses one wavelength by default: the "modis" band set (one REPTRAN wavelength per channel)
-# with the scenario's single channel (CHANNEL: "red" is 646 nm). A run with several wavelengths prints a
-# warning. None keeps the scenario's value. GRID_STEP_NM is for the grid band sets.
-BAND_SET: str | None = "modis"
+# this script uses one wavelength by default: the "single" band set, at the scenario's wavelength_nm (or
+# WAVELENGTH_NM here). A run with several wavelengths prints a warning. None keeps the scenario's value.
+# (Other one-wavelength choices: BAND_SET "modis" or "rgb" with a single CHANNEL.) GRID_STEP_NM is for the
+# grid band sets.
+BAND_SET: str | None = "single"
+WAVELENGTH_NM: float | None = None
 CHANNEL: str | None = None
 GRID_STEP_NM: float | None = None
 
@@ -401,6 +403,7 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
         **({"resolution": RESOLUTION} if RESOLUTION is not None else {}),
         **({"photons_per_pixel": PHOTONS_PER_PIXEL} if PHOTONS_PER_PIXEL is not None else {}),
         **({"band_set": BAND_SET} if BAND_SET is not None else {}),
+        **({"wavelength_nm": WAVELENGTH_NM} if WAVELENGTH_NM is not None else {}),
         **({"channel": CHANNEL} if CHANNEL is not None else {}),
         **({"grid_step_nm": GRID_STEP_NM} if GRID_STEP_NM is not None else {}),
     )
@@ -476,7 +479,7 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
             f"  WARNING: a SMART-G run here has {most} wavelengths. In the tests made for this script such a run\n"
             "  gave the voxel the same result with the Mie and the Henyey-Greenstein phase function, i.e. the\n"
             "  cloud's Mie phase function (and so the bow) did not act, and the DoLP was several times too low.\n"
-            "  Use one wavelength: BAND_SET = \"modis\" or \"rgb\" with a single CHANNEL (\"red\")."
+            "  Use one wavelength: BAND_SET = \"single\" (the scenario's wavelength_nm)."
         )
     theta_reference = np.arange(90.0, 180.0001, 0.25)
     reference = single_scattering(spectrum, voxel["reff_um"], theta_reference)

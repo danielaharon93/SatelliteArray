@@ -124,8 +124,9 @@ class Loaded:
         else None. A rebuilt single channel uses only that channel's camera response."""
         if self.reflectance.shape[-1] != 1:
             return None
-        if "cloudct" in str((self.description or {}).get("band_set", "")):
-            return None  # the CloudCT band sets are one channel of their own, whatever "channel" says
+        band_set = str((self.description or {}).get("band_set", ""))
+        if "cloudct" in band_set or band_set == "single":
+            return None  # the CloudCT and single band sets are one channel of their own, whatever "channel" says
         name = ((self.description or {}).get("scenario") or {}).get("channel")
         if name in CHANNEL_NAMES:
             return CHANNEL_NAMES.index(name)
@@ -155,7 +156,7 @@ def name_band_info(path: Path) -> tuple[str | None, int | None]:
     text = f"{path.parent.name}/{path.name}" if path.stem.startswith("satellite_") else path.name
     single = re.search(r"_(blue|green|red)(?=_noise|/|\.|$)", text)
     index = ["blue", "green", "red"].index(single.group(1)) if single else None
-    if "_grid" in text or "_cloudct" in text:
+    if "_grid" in text or "_cloudct" in text or re.search(r"_single\d", text):  # "single": one chosen wavelength
         return None, index
     return ("modis" if "_modis" in text else "rgb"), index
 

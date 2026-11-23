@@ -80,6 +80,7 @@ from playground_core import (
     CLOUD_SOURCES,
     CONFIG_DIR,
     DEFAULT_AOD_550,
+    DEFAULT_WAVELENGTH_NM,
     GUI_DEFAULT_AEROSOL_MODEL,
     GUI_DEFAULT_AOD_550,
     GUI_DEFAULT_OZONE_DOBSON,
@@ -168,6 +169,8 @@ class SmartgPlayground(HasTraits):
     grid_range_low_nm = Range(300.0, 4000.0, GRID_DEFAULT_RANGE_NM[0], mode="text")
     grid_range_high_nm = Range(300.0, 4000.0, GRID_DEFAULT_RANGE_NM[1], mode="text")
     grid_step_nm = Range(0.5, 1000.0, GRID_DEFAULT_STEP_NM, mode="text")
+    # The "single" band set: its one wavelength.
+    wavelength_nm = Range(300.0, 4000.0, DEFAULT_WAVELENGTH_NM, mode="text")
 
     # "none" is the clear sky: only the atmosphere and the sea or ground, one uniform
     # image per view; there the sea can have its water body (chlorophyll).
@@ -294,20 +297,28 @@ class SmartgPlayground(HasTraits):
                         "uniform over the support (to see what the response in the sampling changes); "
                         "reptran_cloudct and reptran_cloudct_support: the same two as REPTRAN internal bands "
                         "(about 240, so slower), which include the gas absorption lines (e.g. the O2 B band) "
-                        "that single wavelengths lack"
+                        "that single wavelengths lack; single: ONE wavelength of your choice (a gray image) - "
+                        "a run with a single wavelength gives a cloud its Mie phase function (and so the cloudbow) "
+                        "where, in tests, a run with several wavelengths did not"
                     ),
                 ),
                 Item(
                     "channel",
                     label="Color channel",
                     enabled_when=(
-                        "band_set not in ('grid_cloudct', 'grid_cloudct_support', "
+                        "band_set not in ('single', 'grid_cloudct', 'grid_cloudct_support', "
                         "'reptran_cloudct', 'reptran_cloudct_support')"
                     ),
                     tooltip=(
                         "all: blue, green and red (440, 550, 670 nm); or just one of them, "
-                        "which gives a grayscale image. Not used by the CloudCT band sets (one channel)"
+                        "which gives a grayscale image. Not used by the single and CloudCT band sets (one channel)"
                     ),
+                ),
+                Item(
+                    "wavelength_nm",
+                    label="Wavelength (nm)",
+                    tooltip="The one wavelength of the single band set (300 to 4000 nm)",
+                    visible_when="band_set == 'single'",
                 ),
             ),
             VGroup(
@@ -827,6 +838,7 @@ class SmartgPlayground(HasTraits):
             band_set=self.band_set,
             grid_range_nm=[self.grid_range_low_nm, self.grid_range_high_nm],
             grid_step_nm=self.grid_step_nm,
+            wavelength_nm=self.wavelength_nm,
             cloud_source=self.cloud_source,
             bomex_netcdf=self.bomex_netcdf.strip(),
             extinction_method=self.extinction_method,
@@ -874,6 +886,7 @@ class SmartgPlayground(HasTraits):
         self.band_set = config.band_set
         self.grid_range_low_nm, self.grid_range_high_nm = config.grid_range_nm
         self.grid_step_nm = config.grid_step_nm
+        self.wavelength_nm = config.wavelength_nm
         self.cloud_source = config.cloud_source
         self.bomex_netcdf = config.bomex_netcdf
         self.extinction_method = config.extinction_method

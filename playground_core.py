@@ -175,6 +175,12 @@ BAND_SET_GRID = "grid"
 # wavelengths covering that band only (see _grid_modis_spectrum()): a run's photons are only ever
 # given wavelengths inside its band, and the channel is the response x solar irradiance weighted mean.
 BAND_SET_GRID_MODIS = "grid_modis"
+# ONE wavelength of your choice (`wavelength_nm`, a single gray channel): a SMART-G run with a single
+# wavelength, which also gives a cloud its Mie phase function (and so the cloudbow) where a run with several
+# wavelengths did not in the voxel tests of run_cloudbow_voxel_headless.py. Single wavelengths carry only
+# the continuum gas absorption, as the "rgb" band set does.
+BAND_SET_SINGLE = "single"
+DEFAULT_WAVELENGTH_NM = 645.0
 # The CloudCT camera (configs/cloudct/, see cloudct_response.py) as ONE channel: a grid of wavelengths over
 # the camera's support (where its response is at least cloudct_response.SUPPORT_THRESHOLD of its peak, about
 # 588-704 nm), every photon's wavelength drawn in proportion to
@@ -196,7 +202,7 @@ BAND_SET_REPTRAN_CLOUDCT_SUPPORT = "reptran_cloudct_support"
 CLOUDCT_BAND_SETS = (
     BAND_SET_GRID_CLOUDCT, BAND_SET_GRID_CLOUDCT_SUPPORT, BAND_SET_REPTRAN_CLOUDCT, BAND_SET_REPTRAN_CLOUDCT_SUPPORT,
 )
-BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS, BAND_SET_GRID, BAND_SET_GRID_MODIS, *CLOUDCT_BAND_SETS)
+BAND_SETS = (BAND_SET_RGB, BAND_SET_MODIS, BAND_SET_GRID, BAND_SET_GRID_MODIS, BAND_SET_SINGLE, *CLOUDCT_BAND_SETS)
 # The band sets with a wavelength grid: the per-wavelength reflectance (and Stokes parameters) are saved.
 SPECTRAL_BAND_SETS = (BAND_SET_GRID, BAND_SET_GRID_MODIS, *CLOUDCT_BAND_SETS)
 GRID_DEFAULT_RANGE_NM = (400.0, 700.0)
@@ -356,13 +362,18 @@ def make_spectrum(
     channel: str = CHANNEL_ALL,
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    wavelength_nm: float = DEFAULT_WAVELENGTH_NM,
 ) -> Spectrum:
     """The Spectrum for a `band_set` ("rgb", "modis", "grid", "grid_modis", "grid_cloudct" or
     "grid_cloudct_support") and a `channel` ("all", or one of "blue", "green", "red"; the CloudCT
     band sets are one channel and ignore it). `grid_range_nm` only matters for the "grid" band
-    set (pass it as a tuple); `grid_step_nm` for the grid band sets."""
+    set (pass it as a tuple); `grid_step_nm` for the grid band sets; `wavelength_nm` for the "single" band set
+    (one wavelength, one channel, which ignores `channel`)."""
     if channel not in CHANNELS:
         raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
+    if band_set == BAND_SET_SINGLE:
+        wavelength = np.array([float(wavelength_nm)])
+        return Spectrum((f"{wavelength[0]:g} nm",), wavelength, channel_irradiance=solar_irradiance_at(wavelength))
     if band_set in (BAND_SET_GRID_CLOUDCT, BAND_SET_GRID_CLOUDCT_SUPPORT):
         return _grid_cloudct_spectrum(float(grid_step_nm), weighted=band_set == BAND_SET_GRID_CLOUDCT)
     if band_set in (BAND_SET_REPTRAN_CLOUDCT, BAND_SET_REPTRAN_CLOUDCT_SUPPORT):
@@ -634,7 +645,8 @@ def _grid_modis_spectrum(channel: str, grid_step_nm: float) -> Spectrum:
 def config_spectrum(config: "PlaygroundConfig") -> Spectrum:
     """The Spectrum a config asks for: its band set, channel and grid settings."""
     return make_spectrum(
-        config.band_set, config.channel, tuple(config.grid_range_nm), float(config.grid_step_nm)
+        config.band_set, config.channel, tuple(config.grid_range_nm), float(config.grid_step_nm),
+        float(config.wavelength_nm),
     )
 
 
@@ -1109,6 +1121,7 @@ def render_view(
     band_set: str = BAND_SET_RGB,
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    wavelength_nm: float = DEFAULT_WAVELENGTH_NM,
     spectral_out: dict | None = None,
     environment: Environment | None = None,
     stokes_out: dict | None = None,
@@ -1150,7 +1163,7 @@ def render_view(
     cloud = cloud or bundled_cloud()
 
     lat_deg = main.geocentric_latitude_deg(point_a_km)
-    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
+    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm), float(wavelength_nm))
     wavelength_nm, atmosphere, surface, grid_3d, water = build_scene_3d(
         lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum, environment
     )
@@ -1220,6 +1233,7 @@ def render_clear_sky(
     band_set: str = BAND_SET_RGB,
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    wavelength_nm: float = DEFAULT_WAVELENGTH_NM,
     spectral_out: dict | None = None,
     environment: Environment | None = None,
     stokes_out: dict | None = None,
@@ -1246,7 +1260,7 @@ def render_clear_sky(
 
     if n_photons is None:
         n_photons = main.SMARTG_3D_PHOTONS_PER_PIXEL * width_px * height_px
-    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
+    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm), float(wavelength_nm))
     angles = [main.viewing_angles_deg(position_km, ground_km) for position_km, ground_km in views_km]
     lat_deg = main.geocentric_latitude_deg(views_km[0][1])
     sea, water = build_ocean(surface, wind_speed_ms, environment)
@@ -1346,6 +1360,7 @@ def render_formation_frozen(
     band_set: str = BAND_SET_RGB,
     grid_range_nm: tuple[float, float] = GRID_DEFAULT_RANGE_NM,
     grid_step_nm: float = GRID_DEFAULT_STEP_NM,
+    wavelength_nm: float = DEFAULT_WAVELENGTH_NM,
     spectral_out: dict | None = None,
     environment: Environment | None = None,
     stokes_out: dict | None = None,
@@ -1388,7 +1403,7 @@ def render_formation_frozen(
     cloud = cloud or bundled_cloud()
 
     lat_deg = main.geocentric_latitude_deg(target_km)
-    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm))
+    spectrum = make_spectrum(band_set, channel, tuple(grid_range_nm), float(grid_step_nm), float(wavelength_nm))
     wavelength_nm, atmosphere, surface, grid_3d, water = build_scene_3d(
         lat_deg, periodic, surface, wind_speed_ms, cloud, spectrum, environment
     )
@@ -1494,6 +1509,8 @@ class PlaygroundConfig:
     # for blue, green and red) and the bin width of the wavelength grid.
     grid_range_nm: list[float] = field(default_factory=lambda: list(GRID_DEFAULT_RANGE_NM))
     grid_step_nm: float = GRID_DEFAULT_STEP_NM
+    # The "single" band set: its one wavelength (nm).
+    wavelength_nm: float = DEFAULT_WAVELENGTH_NM
 
     # The atmosphere and the sea beyond the cloud (see Environment): an OPAC aerosol
     # with optical depth `aod_550` ("none" = no aerosol), optional ozone (Dobson units),
@@ -1642,6 +1659,8 @@ class PlaygroundConfig:
             )
         if not 0 < self.grid_step_nm <= (self.grid_range_nm[1] - self.grid_range_nm[0]) / 3:
             raise ValueError("grid_step_nm must be > 0 and at most a third of the grid range")
+        if not GRID_MIN_NM <= self.wavelength_nm <= GRID_MAX_NM:
+            raise ValueError(f"wavelength_nm must be between {GRID_MIN_NM:g} and {GRID_MAX_NM:g}")
         if self.cloud_source not in CLOUD_SOURCES:
             raise ValueError(f"cloud_source must be one of {CLOUD_SOURCES}, not {self.cloud_source!r}")
         if require_dataset and self.cloud_source == CLOUD_BOMEX and not self.bomex_netcdf.strip():
@@ -2035,6 +2054,8 @@ class PlaygroundSimulation:
     def _channel_file_suffix(self, config: PlaygroundConfig) -> str:
         """Names the band set (_modis) and a single-channel render (_blue, _green,
         _red); empty for the original settings."""
+        if config.band_set == BAND_SET_SINGLE:  # one wavelength: the channel setting is not used
+            return f"_single{config.wavelength_nm:g}nm"
         band_set = "" if config.band_set == BAND_SET_RGB else f"_{config.band_set}"
         one_channel = config.channel != CHANNEL_ALL and config.band_set not in CLOUDCT_BAND_SETS
         return band_set + (f"_{config.channel}" if one_channel else "")
@@ -2078,6 +2099,7 @@ class PlaygroundSimulation:
                 band_set=config.band_set,
                 grid_range_nm=tuple(config.grid_range_nm),
                 grid_step_nm=config.grid_step_nm,
+                wavelength_nm=config.wavelength_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
                 stokes_out=stokes,
@@ -2102,6 +2124,7 @@ class PlaygroundSimulation:
                 band_set=config.band_set,
                 grid_range_nm=tuple(config.grid_range_nm),
                 grid_step_nm=config.grid_step_nm,
+                wavelength_nm=config.wavelength_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
                 stokes_out=stokes,
@@ -2179,6 +2202,7 @@ class PlaygroundSimulation:
                 band_set=config.band_set,
                 grid_range_nm=tuple(config.grid_range_nm),
                 grid_step_nm=config.grid_step_nm,
+                wavelength_nm=config.wavelength_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
                 stokes_out=stokes,
@@ -2205,6 +2229,7 @@ class PlaygroundSimulation:
                 band_set=config.band_set,
                 grid_range_nm=tuple(config.grid_range_nm),
                 grid_step_nm=config.grid_step_nm,
+                wavelength_nm=config.wavelength_nm,
                 spectral_out=spectral,
                 environment=config.environment(),
                 stokes_out=stokes,
@@ -2591,6 +2616,8 @@ def run_config(config: PlaygroundConfig, log: Callable[[str], None] = print) -> 
     if config.band_set == BAND_SET_GRID:
         log(f"Grid: {len(spectrum.run_wavelength)} wavelengths between {config.grid_range_nm[0]:g} and "
             f"{config.grid_range_nm[1]:g} nm, photons drawn in proportion to response x solar irradiance")
+    if config.band_set == BAND_SET_SINGLE:
+        log(f"One wavelength: {config.wavelength_nm:g} nm (the channel setting is not used)")
     if config.band_set in CLOUDCT_BAND_SETS:
         wavelengths = spectrum.wavelengths_nm
         log(f"CloudCT camera as one channel: {len(wavelengths)} wavelengths over its support "
