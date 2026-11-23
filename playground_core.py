@@ -1754,6 +1754,7 @@ class PlaygroundSimulation:
         self,
         config: PlaygroundConfig,
         on_status: Callable[[str], None] | None = None,
+        cloud: CloudSource | None = None,
     ) -> str:
         """Run one acquisition of the configured scenario, save its
         image(s) under OUTPUT_DIR, and return a one-line (single) or
@@ -1762,10 +1763,14 @@ class PlaygroundSimulation:
         With the pointing error enabled, this starts a new acquisition (see
         PointingNoise.begin_acquisition()), so successive calls walk the
         same seeded random sequence. `on_status` is called with a progress
-        message just before the (slow) SMART-G run starts."""
+        message just before the (slow) SMART-G run starts. `cloud` is a
+        CloudSource to use instead of the one the config asks for (a script's
+        own cloud file, e.g. a single voxel); the config's cloud_source must
+        still be valid."""
         config.validate()
         width_px, height_px = RESOLUTION_PRESETS[config.resolution]
-        cloud = resolve_cloud(config, on_status)  # may build the BOMEX cloud file first
+        if cloud is None:
+            cloud = resolve_cloud(config, on_status)  # may build the BOMEX cloud file first
         if config.pointing_noise_enabled:
             self.noise.begin_acquisition()
         if config.mode == SINGLE_MODE:
