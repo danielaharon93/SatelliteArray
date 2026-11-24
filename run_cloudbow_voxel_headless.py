@@ -107,6 +107,16 @@ MEDIUM_SIZE_M: tuple[float, float, float] | None = (10240.0, 10240.0, 1000.0)
 # outermost 12 % of the half-width (about the block's thickness), so 0.75 leaves that ring out. With a
 # periodic medium every pixel is the same and the whole image is used.
 CENTRE_FRACTION = 0.75
+# The empty margin of the simulation box around the medium, in km, for a NON-periodic medium (main.py's own
+# default is 30). The box is 30 km tall; the render's sensors sit at its top, shifted sideways by (30 km - the
+# cloud's height) x tan(view zenith), and the sun's rays reach the medium from as far sideways (the same
+# with the sun zenith). Both must fit in the margin: otherwise the render stops ("the image footprint was
+# moved past the simulation domain's edge") or the cloud gets no direct sun and is nearly black. None:
+# automatic, 1.25 x the larger of the two shifts, rounded up to a multiple of 10 km, and at least 30 km (60 km
+# for a camera up to 55 deg from the nadir). A number sets it (camera directions that do not fit are
+# skipped with a warning). A wider margin changes the reflectance by about 1-2 % (photons wander out and
+# back), so use the same margin to compare runs. Not used for a periodic medium.
+HORIZ_MARGIN_KM: float | None = None
 
 # The scattering angles, in degrees (at most 180): from START to STOP (included) every STEP. The sun is the
 # scenario's, so these are made by moving the camera. The primary bow of droplets like these is a few
@@ -164,6 +174,7 @@ import run_from_config  # noqa: E402
 playground_core = run_from_config.playground_core
 main = playground_core.main
 playground_core.GRID_REFF_ACC = REFF_DECIMALS  # read when the band set is built, below
+DEFAULT_MARGIN_KM = main.SMARTG_3D_HORIZ_EXTEND_KM  # main.py's margin, kept to restore after a run
 
 
 def find_datasets() -> list[Path]:
@@ -219,6 +230,27 @@ def direct_sun_limit_deg(dat_path: Path, cloud_height_km: float) -> float:
     half_width = 0.5 * float(field["x_bounds"].values[-1] - field["x_bounds"].values[0])
     reach = main.SMARTG_3D_HORIZ_EXTEND_KM + half_width
     return float(np.degrees(np.arctan(reach / max(z_top - cloud_height_km, 1e-6))))
+
+
+def grid_top_km(dat_path: Path) -> float:
+    """The height of the top of the cloud file's grid (km): where the render's sensors sit."""
+    from smartg.atmosphere import read_i3rc_cloud
+
+    return float(read_i3rc_cloud(dat_path)["z_bounds"].values[-1])
+
+
+def automatic_margin_km(top_km: float, height_km: float, sza_deg: float, max_vza_deg: float) -> float:
+    """The margin of the box (km) that holds both the sideways shift of the render's sensors for the largest
+    view zenith and the sideways reach of the sun's rays for the sun zenith: (top - cloud height) x tan(the
+    larger angle), times 1.25, rounded up to a multiple of 10 km, and at least main.py's own margin."""
+    shift = (top_km - height_km) * np.tan(np.radians(max(sza_deg, max_vza_deg)))
+    return float(max(DEFAULT_MARGIN_KM, 10.0 * np.ceil(1.25 * shift / 10.0)))
+
+
+def camera_limit_deg(margin_km: float, top_km: float, height_km: float) -> float:
+    """The largest view zenith (deg) the render can use in a non-periodic box with this margin: the shift of its
+    sensors, (top - cloud height) x tan(view zenith), must be less than the margin."""
+    return float(np.degrees(np.arctan(margin_km / (top_km - height_km))))
 
 
 def view_from_pointing(simulation, off_nadir_deg: float, azimuth_deg: float, height_km: float) -> tuple[float, float]:
@@ -582,18 +614,6 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
     simulation = playground_core.PlaygroundSimulation.from_config(config)
     sza, saa = config.sza_deg, config.saa_deg
     print(f"Sun (the scenario's): zenith {sza:.2f} deg, azimuth {saa:.2f} deg; satellite at {simulation.time_utc}")
-    if not config.periodic:
-        limit = direct_sun_limit_deg(cloud.dat_path, cloud.center_height_km)
-        if sza > limit:
-            print(
-                f"  WARNING: the domain is not periodic and the sun is {sza:.1f} deg from the zenith, more than about "
-                f"{limit:.0f} deg: the sun ray that would reach the medium crosses the top of the grid farther away than "
-                "the grid's horizontal extent, and in tests the cloud was then nearly black (reflectance 0.02 instead of "
-                "0.5, and the DoLP that of the air). Set PERIODIC = True, or use a sun closer to the zenith in the scenario."
-            )
-        else:
-            print(f"  (non-periodic domain: the direct sun reaches the medium up to a sun zenith of about {limit:.0f} deg)")
-
     plan, shadowed = [], []
     for theta in theta_list:
         vza, vaa = camera_for_scattering_angle(theta, sza, saa)
@@ -631,6 +651,40 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
     print(f"  {len(plan)} scattering angles {plan[0]['theta']:g}-{plan[-1]['theta']:g} deg: view zenith "
           f"{min(p['vza'] for p in plan):.1f} to {max(p['vza'] for p in plan):.1f} deg")
 
+    # the margin of the simulation box (a non-periodic medium): it must hold the shift of the render's sensors
+    # (the camera) and the sideways reach of the sun's rays
+    margin = None
+    if not config.periodic:
+        top, height = grid_top_km(cloud.dat_path), cloud.center_height_km
+        automatic = HORIZ_MARGIN_KM is None
+        margin = automatic_margin_km(top, height, sza, max(p["vza"] for p in plan)) if automatic else float(HORIZ_MARGIN_KM)
+        main.SMARTG_3D_HORIZ_EXTEND_KM = margin  # read when the scene is built; restored after the run
+        print(f"  Margin of the simulation box around the medium: {margin:g} km "
+              f"({'automatic' if automatic else 'HORIZ_MARGIN_KM'}; main.py's default is {DEFAULT_MARGIN_KM:g} km)")
+        limit = camera_limit_deg(margin, top, height)
+        too_far = [p for p in plan if p["vza"] >= limit]
+        if too_far:
+            names = ", ".join(f"{p['theta']:g}" for p in too_far)
+            print(
+                f"  WARNING: {len(too_far)} of the {len(plan)} camera directions need a view zenith of {limit:.1f} deg or more "
+                f"({names} deg scattering angle): with a margin of {margin:g} km the "
+                "render's sensors would leave the simulation box, and they are skipped. Set a larger HORIZ_MARGIN_KM, or None "
+                "for the automatic margin."
+            )
+            plan = [p for p in plan if p["vza"] < limit]
+            if not plan:
+                raise ValueError("no camera direction fits in the simulation box: set a larger HORIZ_MARGIN_KM")
+        sun_limit = direct_sun_limit_deg(cloud.dat_path, height)
+        if sza > sun_limit:
+            print(
+                f"  WARNING: the sun is {sza:.1f} deg from the zenith, more than about {sun_limit:.0f} deg: with a margin of "
+                f"{margin:g} km the sun ray that would reach the medium crosses the top of the grid outside the box, and in "
+                "tests the cloud was then nearly black (reflectance 0.02 instead of 0.5). Set a larger HORIZ_MARGIN_KM "
+                "(or None for the automatic margin), or PERIODIC = True."
+            )
+        else:
+            print(f"  (the direct sun reaches the medium up to a sun zenith of about {sun_limit:.0f} deg with this margin)")
+
     spectrum = playground_core.config_spectrum(config)
     labels = tuple(spectrum.labels)
     most = max(len(part.wavelengths_nm) for part in spectrum.runs)
@@ -657,7 +711,7 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
             f"set OUTPUT_DIR (now {output_root}) to a shorter path"
         )
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "voxel.json").write_text(json.dumps({"dataset": path.name, "how": how, "cloud_file": str(voxel_file), **voxel}, indent=2))
+    (folder / "voxel.json").write_text(json.dumps({"dataset": path.name, "how": how, "cloud_file": str(voxel_file), "horiz_margin_km": margin, **voxel}, indent=2))
     rows = []
     for number, step in enumerate(plan, 1):
         theta = step["theta"]
@@ -700,20 +754,23 @@ def main_script() -> int:
     print(f"{len(datasets)} BOMEX file(s); {len(theta_list)} scattering angles ({theta_list[0]:g} to {theta_list[-1]:g} deg)")
 
     done, skipped, failed = [], [], []
-    for number, path in enumerate(datasets, 1):
-        print(f"\n===== [{number}/{len(datasets)}] {path.name} =====")
-        try:
-            if not path.is_file():
-                raise FileNotFoundError(f"{path} does not exist")
-            if not has_droplet_spectrum(path):
-                print("No FNCD droplet spectrum in this file: skipped.")
-                skipped.append(path.name)
-                continue
-            run_dataset(path, base, theta_list, output_root)
-            done.append(path.name)
-        except Exception:  # one bad file should not stop the rest of the batch
-            traceback.print_exc()
-            failed.append(path.name)
+    try:
+        for number, path in enumerate(datasets, 1):
+            print(f"\n===== [{number}/{len(datasets)}] {path.name} =====")
+            try:
+                if not path.is_file():
+                    raise FileNotFoundError(f"{path} does not exist")
+                if not has_droplet_spectrum(path):
+                    print("No FNCD droplet spectrum in this file: skipped.")
+                    skipped.append(path.name)
+                    continue
+                run_dataset(path, base, theta_list, output_root)
+                done.append(path.name)
+            except Exception:  # one bad file should not stop the rest of the batch
+                traceback.print_exc()
+                failed.append(path.name)
+    finally:
+        main.SMARTG_3D_HORIZ_EXTEND_KM = DEFAULT_MARGIN_KM  # this script's margin is not left in main.py
 
     print(f"\nDone: {len(done)}, skipped: {len(skipped)}, failed: {len(failed)}")
     for name in failed:
