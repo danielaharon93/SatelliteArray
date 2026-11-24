@@ -9,15 +9,18 @@ one whose effective radius is the median. It is written as a small cloud file (t
 empty, as in the BOMEX cloud file, so the atmosphere is still modelled all the way down).
 
 The voxel supplies only the PHYSICAL PROPERTIES of the medium (its extinction and droplet radius); the
-medium's SIZE is MEDIUM_SIZE_M (x, y, z in metres; the voxel's own 20 m size by default). Being homogeneous,
-a bigger medium only changes its optical depth (the extinction x its thickness) and its horizontal extent.
+medium's SIZE is MEDIUM_SIZE_M (x, y, z in metres). Being homogeneous, a bigger medium only changes its
+optical depth (the extinction x its thickness) and its horizontal extent. By default it is a LARGE,
+NON-PERIODIC block: 10.24 km x 10.24 km (the BOMEX field's footprint) and 1 km thick, optical depth about
+160, isolated in the empty domain. The DoLP is then taken from the central part of the image
+(CENTRE_FRACTION), because near the block's edge light leaks out of the sides. A non-periodic domain also
+needs the sun not too far from the zenith (the script warns, see PERIODIC).
 
-With PERIODIC the medium repeats horizontally, which makes it an infinite homogeneous layer as thick as
-the medium (20 m by default): every pixel of the image then sees the same medium, so the image's mean Stokes
-parameters are the right quantity (no sea or cloud-edge pixels to separate) and the pixels only add
-photons. (SMART-G's periodic grid needs at least 2 cells per direction, so the file holds a 2 x 2
-block of identical voxels.) Without PERIODIC, the voxel is one isolated 20 m cube, which is mostly
-transparent to a camera that looks at the sea behind it.
+With PERIODIC = True the medium repeats horizontally instead, an infinite homogeneous layer: every pixel
+of the image then sees the same medium, so the image's mean Stokes parameters are the right quantity
+(no edges) and the pixels only add photons. (SMART-G's periodic grid needs at least 2 cells per
+direction, so the file holds a 2 x 2 block of identical cells.) An isolated block as small as the voxel
+itself (MEDIUM_SIZE_M = None, 20 m) is mostly transparent to a camera that looks at the sea behind it.
 
 Unlike run_cloudbow_headless.py, the SUN is fixed - the scenario's sun_zenith and sun_azimuth - and the
 scattering angle is changed by moving the CAMERA, in the vertical plane of the sun. With the signed view
@@ -84,17 +87,26 @@ GENERATED_CLOUD_DIR = "generated_clouds"
 # VOXEL = (ix, iy, iz), zero-based indices into the field, which overrides the choice.
 MIN_VOXEL_OPTICAL_DEPTH = 3.0
 VOXEL: tuple[int, int, int] | None = None
-# True: the voxel repeats horizontally (an infinite homogeneous layer, the voxel's thickness). False:
-# one isolated voxel. This is part of what makes the medium homogeneous, so it is set here and not by
-# the scenario's own "periodic" setting.
-PERIODIC = True
+# True: the medium repeats horizontally (an infinite homogeneous layer). False: one isolated block of the
+# size MEDIUM_SIZE_M. This is part of what makes the medium homogeneous, so it is set here and not by the
+# scenario's own "periodic" setting. An isolated block needs to be large (see MEDIUM_SIZE_M and
+# CENTRE_FRACTION), and the sun not too low: above a sun zenith of about 48-51 deg the direct sun does not
+# reach a medium in a non-periodic domain (the script warns).
+PERIODIC = False
 # The size of the medium, (x, y, z) in metres. The voxel supplies only the PHYSICAL PROPERTIES of the
 # medium (the extinction per km and the droplet effective radius); the medium is homogeneous, so its size
 # only sets its optical depth (the extinction x z) and its horizontal extent (the period of a periodic
-# layer, or the width of an isolated block). It is centred, vertically, on the voxel's height. None: the
-# voxel's own size (20 x 20 m horizontally and its thickness, 20 m for the BOMEX layers; a periodic layer
-# is then a 2 x 2 block of them, 40 m wide).
-MEDIUM_SIZE_M: tuple[float, float, float] | None = None
+# layer, or the width of an isolated block). It is centred, vertically, on the voxel's height (so z is at
+# most twice that height). The default here is a large block: the BOMEX field's 10.24 km footprint and
+# 1 km thick (optical depth about 160, a thick cumulus). None: the voxel's own size (20 x 20 m horizontally
+# and its thickness, 20 m for the BOMEX layers; a periodic layer is then a 2 x 2 block of them, 40 m wide).
+MEDIUM_SIZE_M: tuple[float, float, float] | None = (10240.0, 10240.0, 1000.0)
+# Used when the medium is NOT periodic: the DoLP is taken from the central square of the image that covers
+# this fraction of its width (1: the whole image). Near the edge of a finite block light leaks out of the
+# sides: in a test with the 10.24 km x 1 km block the reflectance was flat inside and fell only in the
+# outermost 12 % of the half-width (about the block's thickness), so 0.75 leaves that ring out. With a
+# periodic medium every pixel is the same and the whole image is used.
+CENTRE_FRACTION = 0.75
 
 # The scattering angles, in degrees (at most 180): from START to STOP (included) every STEP. The sun is the
 # scenario's, so these are made by moving the camera. The primary bow of droplets like these is a few
@@ -192,6 +204,21 @@ def camera_for_scattering_angle(theta_deg: float, sza_deg: float, saa_deg: float
     if t >= 0.0:
         return t, saa_deg % 360.0
     return -t, (saa_deg + 180.0) % 360.0
+
+
+def direct_sun_limit_deg(dat_path: Path, cloud_height_km: float) -> float:
+    """The sun zenith angle above which, in a NON-periodic domain, the direct sun does not reach the cloud:
+    the sun ray through the cloud crosses the top of the grid (about 30 km up) at a horizontal distance of
+    (top - cloud height) x tan(sun zenith) from it, and the grid reaches only its horizontal extension
+    (main.SMARTG_3D_HORIZ_EXTEND_KM) and half the cloud file's width beyond the cloud's centre. In tests the
+    cloud was nearly black above it. A periodic domain has no such limit."""
+    from smartg.atmosphere import read_i3rc_cloud
+
+    field = read_i3rc_cloud(dat_path)
+    z_top = float(field["z_bounds"].values[-1])
+    half_width = 0.5 * float(field["x_bounds"].values[-1] - field["x_bounds"].values[0])
+    reach = main.SMARTG_3D_HORIZ_EXTEND_KM + half_width
+    return float(np.degrees(np.arctan(reach / max(z_top - cloud_height_km, 1e-6))))
 
 
 def view_from_pointing(simulation, off_nadir_deg: float, azimuth_deg: float, height_km: float) -> tuple[float, float]:
@@ -376,12 +403,18 @@ def describe_bow(theta: np.ndarray, dolp: np.ndarray, f11: np.ndarray) -> str:
 # ---------------------------------------------------------------------------------- the polarization
 
 
-def polarization_of(stokes: np.ndarray) -> dict:
+def polarization_of(stokes: np.ndarray, centre_fraction: float = 1.0) -> dict:
     """(4, h, w, n_channels) Stokes parameters -> per channel the mean Stokes parameters over the image (every
-    pixel sees the same medium), the DoLP and AoLP of those means, and the standard error of the DoLP:
-    the pixels are split into NOISE_GROUPS interleaved groups, each group's DoLP is taken, and the
-    error is the spread of those over the square root of their number."""
+    pixel sees the same medium), or over its central square of `centre_fraction` of the width, the DoLP and
+    AoLP of those means, and the standard error of the DoLP: the pixels are split into NOISE_GROUPS
+    interleaved groups, each group's DoLP is taken, and the error is the spread of those over the square
+    root of their number."""
     n_channels = stokes.shape[-1]
+    if not 0.0 < centre_fraction <= 1.0:
+        raise ValueError(f"CENTRE_FRACTION must be in (0, 1], not {centre_fraction}")
+    height, width = stokes.shape[1:3]
+    half_h, half_w = max(1, round(height * centre_fraction / 2)), max(1, round(width * centre_fraction / 2))
+    stokes = stokes[:, height // 2 - half_h : height // 2 + half_h, width // 2 - half_w : width // 2 + half_w]
     pixels = stokes.reshape(4, -1, n_channels)
     mean = pixels.mean(axis=1)
     dolp, aolp = playground_core.stokes_to_polarization(mean)
@@ -549,6 +582,17 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
     simulation = playground_core.PlaygroundSimulation.from_config(config)
     sza, saa = config.sza_deg, config.saa_deg
     print(f"Sun (the scenario's): zenith {sza:.2f} deg, azimuth {saa:.2f} deg; satellite at {simulation.time_utc}")
+    if not config.periodic:
+        limit = direct_sun_limit_deg(cloud.dat_path, cloud.center_height_km)
+        if sza > limit:
+            print(
+                f"  WARNING: the domain is not periodic and the sun is {sza:.1f} deg from the zenith, more than about "
+                f"{limit:.0f} deg: the sun ray that would reach the medium crosses the top of the grid farther away than "
+                "the grid's horizontal extent, and in tests the cloud was then nearly black (reflectance 0.02 instead of "
+                "0.5, and the DoLP that of the air). Set PERIODIC = True, or use a sun closer to the zenith in the scenario."
+            )
+        else:
+            print(f"  (non-periodic domain: the direct sun reaches the medium up to a sun zenith of about {limit:.0f} deg)")
 
     plan, shadowed = [], []
     for theta in theta_list:
@@ -625,7 +669,7 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
             dataclasses.replace(config, off_nadir_deg=step["eta"], view_azimuth_deg=step["phi"]), on_status=print, cloud=cloud
         )
         [stokes_file] = playground_core.OUTPUT_DIR.glob("*_stokes.npy")
-        rows.append({**step, **polarization_of(np.load(stokes_file))})
+        rows.append({**step, **polarization_of(np.load(stokes_file), 1.0 if config.periodic else CENTRE_FRACTION)})
         print("  DoLP " + ", ".join(f"{label}: {100 * d:.2f} +- {100 * e:.2f} %"
                                     for label, d, e in zip(labels, rows[-1]["dolp"], rows[-1]["dolp_error"]))
               + f"   ({time.time() - started:.0f} s)")
