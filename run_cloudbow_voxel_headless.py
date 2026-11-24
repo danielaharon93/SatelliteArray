@@ -8,19 +8,33 @@ least MIN_VOXEL_OPTICAL_DEPTH - the cores of the clouds, not their hazy edges or
 one whose effective radius is the median. It is written as a small cloud file (the layers below it
 empty, as in the BOMEX cloud file, so the atmosphere is still modelled all the way down).
 
-With PERIODIC the voxel repeats horizontally, which makes it an infinite homogeneous layer as thick as
-the voxel (20 m): every pixel of the image then sees the same medium, so the image's mean Stokes
+The voxel supplies only the PHYSICAL PROPERTIES of the medium (its extinction and droplet radius); the
+medium's SIZE is MEDIUM_SIZE_M (x, y, z in metres; the voxel's own 20 m size by default). Being homogeneous,
+a bigger medium only changes its optical depth (the extinction x its thickness) and its horizontal extent.
+
+With PERIODIC the medium repeats horizontally, which makes it an infinite homogeneous layer as thick as
+the medium (20 m by default): every pixel of the image then sees the same medium, so the image's mean Stokes
 parameters are the right quantity (no sea or cloud-edge pixels to separate) and the pixels only add
 photons. (SMART-G's periodic grid needs at least 2 cells per direction, so the file holds a 2 x 2
 block of identical voxels.) Without PERIODIC, the voxel is one isolated 20 m cube, which is mostly
 transparent to a camera that looks at the sea behind it.
 
-As in run_cloudbow_headless.py, the satellite's view is the scenario's and the scattering angle is
-changed by moving the SUN in the vertical plane of the view:
+Unlike run_cloudbow_headless.py, the SUN is fixed - the scenario's sun_zenith and sun_azimuth - and the
+scattering angle is changed by moving the CAMERA, in the vertical plane of the sun. With the signed view
+zenith t = sun zenith - (180 deg - scattering angle), the camera is on the sun's side (the sun's azimuth,
+view zenith t) for t >= 0 and on the opposite side (azimuth + 180 deg, view zenith -t) for t < 0, so that
 
-    scattering angle = 180 deg - |sun zenith - view zenith|    (view zenith: at the cloud's height)
+    scattering angle = 180 deg - |sun zenith - t|    (the view zenith is at the cloud's height)
 
-and everything else - the satellite, the surface, the atmosphere, the resolution, the photons, the
+the camera crossing the nadir at scattering angle 180 deg - sun zenith. The satellite is the scenario's (its
+position follows from the TLE and the time), and each camera direction is made by pointing it: the script
+finds the off-nadir angle and the pointing azimuth that give the wanted view direction at the cloud (they
+replace the scenario's own). A camera direction can be SHADOWED BY THE EARTH: if the camera would be at or
+below the horizon of the cloud (view zenith 90 deg or more), or the satellite cannot point at it (past the
+Earth's limb, or beyond the playground's largest off-nadir angle), the script prints a warning and skips
+that angle.
+
+Everything else - the satellite, the sun, the surface, the atmosphere, the resolution, the photons, the
 extinction method and the phase function - is the scenario's own (configs/scenario.json). The exception
 is the wavelength: BAND_SET (and WAVELENGTH_NM) below select ONE wavelength (see there for why).
 
@@ -74,9 +88,17 @@ VOXEL: tuple[int, int, int] | None = None
 # one isolated voxel. This is part of what makes the medium homogeneous, so it is set here and not by
 # the scenario's own "periodic" setting.
 PERIODIC = True
+# The size of the medium, (x, y, z) in metres. The voxel supplies only the PHYSICAL PROPERTIES of the
+# medium (the extinction per km and the droplet effective radius); the medium is homogeneous, so its size
+# only sets its optical depth (the extinction x z) and its horizontal extent (the period of a periodic
+# layer, or the width of an isolated block). It is centred, vertically, on the voxel's height. None: the
+# voxel's own size (20 x 20 m horizontally and its thickness, 20 m for the BOMEX layers; a periodic layer
+# is then a 2 x 2 block of them, 40 m wide).
+MEDIUM_SIZE_M: tuple[float, float, float] | None = None
 
-# The scattering angles, in degrees: from START to STOP (included) every STEP. The primary bow of
-# droplets like these is a few degrees wide, near 140 degrees, so a step of 1 or less is needed.
+# The scattering angles, in degrees (at most 180): from START to STOP (included) every STEP. The sun is the
+# scenario's, so these are made by moving the camera. The primary bow of droplets like these is a few
+# degrees wide, near 140 degrees, so a step of 1 or less is needed.
 ANGLE_START_DEG = 125.0
 ANGLE_STOP_DEG = 155.0
 ANGLE_STEP_DEG = 1.0
@@ -107,8 +129,6 @@ PLAN_ONLY = False
 OUTPUT_DIR = "cloudbow_voxel_runs"
 # =======================================================================
 
-# The largest sun zenith angle the plan may need.
-MAX_SUN_ZENITH_DEG = 80.0
 # One droplet radius needs no coarse rounding (the grid band sets round to 1 um to save memory with a
 # whole cloud's many radii): keep this many decimals of the voxel's effective radius.
 REFF_DECIMALS = 2
@@ -163,16 +183,59 @@ def scattering_angle_deg(sza_deg: float, saa_deg: float, vza_deg: float, vaa_deg
     return float(np.degrees(np.arccos(np.clip(-cos_angle, -1.0, 1.0))))
 
 
-def sun_for_scattering_angle(theta_deg: float, vza_deg: float, vaa_deg: float) -> tuple[float, float]:
-    """(sun zenith, sun azimuth) that give the scattering angle for the view (vza, vaa): the sun in the
-    vertical plane of the view, on the camera's side, `180 - theta` degrees from the view direction
-    (farther from the zenith than the camera)."""
-    return vza_deg + (180.0 - theta_deg), vaa_deg % 360.0
+def camera_for_scattering_angle(theta_deg: float, sza_deg: float, saa_deg: float) -> tuple[float, float]:
+    """(view zenith, view azimuth) of the camera that gives the scattering angle for the fixed sun (sza,
+    saa): in the vertical plane of the sun, at the signed zenith t = sza - (180 - theta) - on the sun's side
+    for t >= 0, on the opposite side (azimuth + 180) for t < 0 - the way through the nadir that keeps the
+    view zenith smallest. The scattering angle is then 180 - |sza - t|."""
+    t = sza_deg - (180.0 - theta_deg)
+    if t >= 0.0:
+        return t, saa_deg % 360.0
+    return -t, (saa_deg + 180.0) % 360.0
+
+
+def view_from_pointing(simulation, off_nadir_deg: float, azimuth_deg: float, height_km: float) -> tuple[float, float]:
+    """The (view zenith, view azimuth) at the cloud, at height_km, when the scenario's satellite points
+    off_nadir_deg away from nadir toward azimuth_deg: what the render uses as the camera's direction."""
+    point_a_km = simulation.point_a_km(off_nadir_deg, azimuth_deg)
+    return main.viewing_angles_deg(simulation.position_km, main.aim_point_km(point_a_km, height_km))
+
+
+def pointing_for_view(simulation, height_km: float, vza_deg: float, vaa_deg: float):
+    """(off-nadir, pointing azimuth), in degrees, with which the satellite looks at the cloud from the view
+    direction (vza, vaa), or None when no pointing does (beyond the Earth's limb, or no convergence). The
+    law of sines gives the start (sin(off-nadir) = Earth radius x sin(view zenith) / orbit radius; the
+    azimuth is opposite), and a Newton iteration with a numerical Jacobian finishes it."""
+    radius, orbit = main.EARTH_RADIUS_KM, float(np.linalg.norm(simulation.position_km))
+    limb = float(np.degrees(np.arcsin(radius / orbit)))  # the off-nadir of the ray that grazes the Earth
+    if vza_deg < 1e-3:  # straight above the cloud: the nadir, whatever the azimuth
+        return 0.0, 0.0
+    wrap = lambda angle: (angle + 180.0) % 360.0 - 180.0
+    eta = float(np.degrees(np.arcsin(min(1.0, radius * np.sin(np.radians(vza_deg)) / orbit))))
+    phi = (vaa_deg + 180.0) % 360.0
+    step = 1e-4
+
+    def residual(e, f):
+        vz, va = view_from_pointing(simulation, e, f, height_km)
+        return np.array([vz - vza_deg, wrap(va - vaa_deg)])
+
+    for _ in range(40):
+        r = residual(eta, phi)
+        if np.abs(r).max() < 1e-8:
+            return (eta, phi % 360.0) if eta < limb else None
+        jacobian = np.column_stack([(residual(eta + step, phi) - r) / step, (residual(eta, phi + step) - r) / step])
+        try:
+            delta = np.linalg.solve(jacobian, -r)
+        except np.linalg.LinAlgError:
+            return None
+        eta = float(np.clip(eta + np.clip(delta[0], -5.0, 5.0), 0.0, limb - 1e-6))
+        phi = (phi + float(np.clip(delta[1], -30.0, 30.0))) % 360.0
+    return None
 
 
 def angles() -> list[float]:
-    if ANGLE_STEP_DEG <= 0 or ANGLE_STOP_DEG < ANGLE_START_DEG:
-        sys.exit("Set ANGLE_START_DEG <= ANGLE_STOP_DEG and ANGLE_STEP_DEG > 0.")
+    if ANGLE_STEP_DEG <= 0 or ANGLE_STOP_DEG < ANGLE_START_DEG or ANGLE_STOP_DEG > 180.0:
+        sys.exit("Set ANGLE_START_DEG <= ANGLE_STOP_DEG <= 180 and ANGLE_STEP_DEG > 0.")
     n = int(np.floor((ANGLE_STOP_DEG - ANGLE_START_DEG) / ANGLE_STEP_DEG + 1e-9)) + 1
     return [float(ANGLE_START_DEG + k * ANGLE_STEP_DEG) for k in range(n)]
 
@@ -222,23 +285,48 @@ def voxel_info(field, index: tuple[int, int, int]) -> dict:
     }
 
 
+def medium_of(field, voxel: dict, cells: int, size_m: tuple[float, float, float] | None) -> dict:
+    """The voxel's properties with the size of the medium: `size_m` (x, y, z) in metres, or the voxel's own
+    size when None (`cells` of its horizontal size across, and its thickness). The medium is centred,
+    vertically, on the voxel, so the aim point of the view does not move. Adds `size_m`, the medium's
+    `z_bottom_km`, `z_top_km`, `thickness_km` and `optical_depth` (extinction x thickness)."""
+    if size_m is None:
+        dx = float(np.diff(field["x_bounds"].values)[0]) * 1000.0
+        dy = float(np.diff(field["y_bounds"].values)[0]) * 1000.0
+        size_m = (cells * dx, cells * dy, 1000.0 * voxel["thickness_km"])
+    if len(size_m) != 3 or not all(v > 0 for v in size_m):
+        raise ValueError(f"MEDIUM_SIZE_M must be three positive numbers (x, y, z) in metres, not {size_m!r}")
+    z_centre = 0.5 * (voxel["z_bottom_km"] + voxel["z_top_km"])
+    z_bottom, z_top = z_centre - size_m[2] / 2000.0, z_centre + size_m[2] / 2000.0
+    if z_bottom < 0.0:
+        raise ValueError(
+            f"a medium {size_m[2]:g} m thick, centred on the voxel at {1000 * z_centre:.0f} m, would reach below the "
+            f"ground: use a thickness of at most {2000 * z_centre:.0f} m, or another voxel"
+        )
+    thickness = z_top - z_bottom
+    return {**voxel, "size_m": [float(v) for v in size_m], "z_bottom_km": z_bottom, "z_top_km": z_top,
+            "thickness_km": thickness, "optical_depth": voxel["extinction_per_km"] * thickness}
+
+
 def write_voxel_cloud(field, info: dict, source: str, path: Path, cells: int) -> Path:
-    """The cumulus-format cloud file of the voxel: `cells` x `cells` identical voxels horizontally (one
-    voxel, or a block of them that a periodic domain repeats), the BOMEX field's own layers from the
-    ground up to the voxel (empty but for it), and the empty padding above that the BOMEX file has (the
-    atmosphere is modelled only on the grid's layers)."""
+    """The cumulus-format cloud file of the medium `info` (see medium_of): `cells` x `cells` identical cells
+    across its x, y size (one, or a block that a periodic domain repeats), one layer of its thickness, the
+    BOMEX field's own (empty) layers below it from the ground up, and above it the empty padding the BOMEX
+    file has (the atmosphere is modelled only on the grid's layers)."""
     import cumulus_file
 
-    iz = info["iz"]
-    z_bounds = field["z_bounds"].values[: iz + 2]
-    pad = [e for e in cumulus_file.TOP_PAD_EDGES_KM if e > z_bounds[-1] + cumulus_file.TOP_PAD_MIN_KM]
-    dx = float(np.diff(field["x_bounds"].values)[0])
-    dy = float(np.diff(field["y_bounds"].values)[0])
-    grid = cumulus_file.CumulusGrid(cells, cells, dx, dy, np.concatenate([z_bounds, pad]), nz_data=iz + 1)
-    cf = cumulus_file.create_cumulus_file(path, grid, f"{cells}x{cells} identical voxels of {source}: {info}")
-    ext = np.zeros((iz + 1, cells, cells))
-    reff = np.zeros((iz + 1, cells, cells))
-    ext[iz], reff[iz] = info["extinction_per_km"], info["reff_um"]
+    bottom, top = info["z_bottom_km"], info["z_top_km"]
+    native = field["z_bounds"].values
+    below = native[native < bottom - 1e-9]  # the BOMEX layers under the medium (the ground, 0 km, is the first)
+    z_bounds = np.concatenate([below, [bottom, top]])
+    nz_data = len(z_bounds) - 1
+    pad = [e for e in cumulus_file.TOP_PAD_EDGES_KM if e > top + cumulus_file.TOP_PAD_MIN_KM]
+    dx, dy = info["size_m"][0] / 1000.0 / cells, info["size_m"][1] / 1000.0 / cells
+    grid = cumulus_file.CumulusGrid(cells, cells, dx, dy, np.concatenate([z_bounds, pad]), nz_data=nz_data)
+    cf = cumulus_file.create_cumulus_file(path, grid, f"{cells}x{cells} identical cells, {info['size_m']} m, from {source}: {info}")
+    ext = np.zeros((nz_data, cells, cells))
+    reff = np.zeros((nz_data, cells, cells))
+    ext[-1], reff[-1] = info["extinction_per_km"], info["reff_um"]
     cumulus_file.set_extinction(cf, ext)
     cumulus_file.set_effective_radius(cf, reff)
     cumulus_file.write_cells(cf)
@@ -308,12 +396,13 @@ def polarization_of(stokes: np.ndarray) -> dict:
 
 
 def write_outputs(folder: Path, dataset: str, labels: tuple, rows: list[dict], reference: dict,
-                  theta_reference: np.ndarray, view: tuple, config, voxel: dict) -> None:
+                  theta_reference: np.ndarray, sun: tuple, config, voxel: dict) -> None:
     """cloudbow_voxel.csv (one line per angle and channel) and cloudbow_voxel.pdf."""
     with (folder / "cloudbow_voxel.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
-            ["scattering_angle_deg", "sun_zenith_deg", "sun_azimuth_deg", "channel", "I", "Q", "U", "V",
+            ["scattering_angle_deg", "view_zenith_deg", "view_azimuth_deg", "off_nadir_deg", "pointing_azimuth_deg",
+             "sun_zenith_deg", "sun_azimuth_deg", "channel", "I", "Q", "U", "V",
              "dolp_percent", "dolp_error_percent", "aolp_deg", "single_scattering_dolp_percent", "single_scattering_F11"]
         )
         for row in rows:
@@ -322,7 +411,8 @@ def write_outputs(folder: Path, dataset: str, labels: tuple, rows: list[dict], r
                 dolp_ss = 100 * float(np.interp(row["theta"], theta_reference, reference["dolp"][k]))
                 f11_ss = float(np.interp(row["theta"], theta_reference, reference["f11"][k]))
                 writer.writerow(
-                    [f"{row['theta']:.3f}", f"{row['sza']:.3f}", f"{row['saa']:.3f}", label,
+                    [f"{row['theta']:.3f}", f"{row['vza']:.3f}", f"{row['vaa']:.3f}", f"{row['eta']:.3f}", f"{row['phi']:.3f}",
+                     f"{sun[0]:.3f}", f"{sun[1]:.3f}", label,
                      *(f"{v:.6g}" for v in s), f"{100 * row['dolp'][k]:.4f}", f"{100 * row['dolp_error'][k]:.4f}",
                      f"{row['aolp'][k]:.2f}", f"{dolp_ss:.4f}", f"{f11_ss:.6g}"]
                 )
@@ -363,16 +453,16 @@ def write_outputs(folder: Path, dataset: str, labels: tuple, rows: list[dict], r
     handles = bottom.get_legend_handles_labels()
     handles2 = twin.get_legend_handles_labels()
     bottom.legend(handles[0] + handles2[0], handles[1] + handles2[1], fontsize=7, loc="best")
-    vza, vaa = view
+    sza, saa = sun
     figure.suptitle("Cloudbow of one homogeneous BOMEX voxel: polarization and reflectance against scattering angle", fontsize=10)
     top.set_title(
         f"{dataset}\n"
-        f"voxel: extinction {voxel['extinction_per_km']:.1f} /km, thickness {1000 * voxel['thickness_km']:.0f} m, "
-        f"optical depth {voxel['optical_depth']:.2f}, droplet radius {voxel['reff_um']:.2f} um, "
-        f"{'periodic layer' if config.periodic else 'isolated voxel'}\n"
-        f"view zenith {vza:.1f} deg, azimuth {vaa:.1f} deg; sun in the view's vertical plane, zenith "
-        f"{rows[0]['sza']:.1f} to {rows[-1]['sza']:.1f} deg; {config.band_set}, {config.resolution}, "
-        f"{config.photons_per_pixel:g} photons/pixel",
+        f"medium: {voxel['size_m'][0]:g} x {voxel['size_m'][1]:g} x {voxel['size_m'][2]:g} m, extinction "
+        f"{voxel['extinction_per_km']:.1f} /km, optical depth {voxel['optical_depth']:.2f}, "
+        f"droplet radius {voxel['reff_um']:.2f} um, {'periodic layer' if config.periodic else 'isolated block'}\n"
+        f"sun zenith {sza:.1f} deg, azimuth {saa:.1f} deg (the scenario's); camera in the sun's vertical plane, "
+        f"view zenith {min(r['vza'] for r in rows):.1f} to {max(r['vza'] for r in rows):.1f} deg; "
+        f"{config.band_set}, {config.resolution}, {config.photons_per_pixel:g} photons/pixel",
         fontsize=6.5,
     )
     figure.text(
@@ -436,10 +526,15 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
           f"  height {voxel['z_bottom_km']:.2f}-{voxel['z_top_km']:.2f} km, extinction {voxel['extinction_per_km']:.1f} /km, "
           f"optical depth {voxel['optical_depth']:.2f}, droplet radius {voxel['reff_um']:.2f} um")
     # SMART-G's periodic grid needs at least 2 cells in each horizontal direction (one cell gives
-    # almost no signal), so the periodic layer is a 2 x 2 block of identical voxels: the same medium.
+    # almost no signal), so the periodic layer is a 2 x 2 block of identical cells: the same medium.
     cells = PERIODIC_CELLS if config.periodic else 1
+    voxel = medium_of(field, voxel, cells, MEDIUM_SIZE_M)  # from here on: the medium (the voxel's properties, its size)
+    x_m, y_m, z_m = voxel["size_m"]
+    print(f"Medium: {x_m:g} x {y_m:g} x {z_m:g} m ({'repeated horizontally' if config.periodic else 'isolated'}), height "
+          f"{voxel['z_bottom_km']:.3f}-{voxel['z_top_km']:.3f} km, optical depth {voxel['optical_depth']:.2f} "
+          f"(extinction x {z_m:g} m)")
     key = hashlib.sha1(
-        f"{field_file}|{iz},{iy},{ix}|{voxel['extinction_per_km']}|{voxel['reff_um']}|{cells}|v2".encode()
+        f"{field_file}|{iz},{iy},{ix}|{voxel['extinction_per_km']}|{voxel['reff_um']}|{cells}|{voxel['size_m']}|v3".encode()
     ).hexdigest()[:10]
     voxel_file = resolve(GENERATED_CLOUD_DIR) / f"voxel_{key}.dat"
     if not voxel_file.exists():
@@ -449,27 +544,48 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
         partial.replace(voxel_file)
     cloud = playground_core.CloudSource(voxel_file, config.phase_function, config.hg_g)
     print(f"Cloud (the voxel, from the scenario's physics): extinction {config.extinction_method}, phase function "
-          f"{config.phase_function}, {'periodic layer' if config.periodic else 'isolated voxel'}; file {voxel_file.name}")
+          f"{config.phase_function}, {'periodic layer' if config.periodic else 'isolated block'}; file {voxel_file.name}")
 
     simulation = playground_core.PlaygroundSimulation.from_config(config)
-    point_a_km = simulation.point_a_km(config.off_nadir_deg, config.view_azimuth_deg)
-    vza, vaa = main.viewing_angles_deg(simulation.position_km, main.aim_point_km(point_a_km, cloud.center_height_km))
-    print(f"View from the ground point: zenith {vza:.2f} deg, azimuth {vaa:.2f} deg (satellite at {simulation.time_utc})")
+    sza, saa = config.sza_deg, config.saa_deg
+    print(f"Sun (the scenario's): zenith {sza:.2f} deg, azimuth {saa:.2f} deg; satellite at {simulation.time_utc}")
 
-    plan = []
+    plan, shadowed = [], []
     for theta in theta_list:
-        sza, saa = sun_for_scattering_angle(theta, vza, vaa)
-        if not 0.0 <= sza <= MAX_SUN_ZENITH_DEG:
-            raise ValueError(
-                f"scattering angle {theta:g} deg needs a sun zenith angle of {sza:.1f} deg with this view "
-                f"(allowed 0 to {MAX_SUN_ZENITH_DEG:g}): choose other angles"
+        vza, vaa = camera_for_scattering_angle(theta, sza, saa)
+        if vza >= 90.0 - 1e-9:
+            shadowed.append((theta, vza, True, "the camera would be at or below the horizon of the cloud"))
+            continue
+        pointing = pointing_for_view(simulation, cloud.center_height_km, vza, vaa)
+        if pointing is None:
+            shadowed.append((theta, vza, True, "the satellite cannot point there (past the Earth's limb from its position)"))
+            continue
+        eta, phi = pointing
+        if eta > playground_core.MAX_OFF_NADIR_DEG:
+            shadowed.append((theta, vza, False, f"it needs an off-nadir angle of {eta:.1f} deg, above the playground's "
+                                                f"limit of {playground_core.MAX_OFF_NADIR_DEG:g} deg"))
+            continue
+        view_zenith, view_azimuth = view_from_pointing(simulation, eta, phi, cloud.center_height_km)
+        check = scattering_angle_deg(sza, saa, view_zenith, view_azimuth)
+        if abs(check - theta) > 1e-4:
+            raise AssertionError(f"scattering angle {check} instead of {theta} for the pointing found")
+        plan.append({"theta": theta, "vza": view_zenith, "vaa": view_azimuth, "eta": eta, "phi": phi})
+        print(f"  scattering angle {theta:6.2f} deg: view zenith {view_zenith:5.2f}, azimuth {view_azimuth:6.2f} deg "
+              f"(pointing: off-nadir {eta:5.2f}, azimuth {phi:6.2f} deg)")
+    for earth, headline in (
+        (True, "shadowed by the Earth (the satellite cannot see the cloud from there)"),
+        (False, "outside the satellite's pointing range in the playground"),
+    ):
+        group = [s for s in shadowed if s[2] is earth]
+        if group:
+            print(
+                f"  WARNING: {len(group)} of the {len(theta_list)} camera directions are {headline} and are skipped:\n    "
+                + "\n    ".join(f"scattering angle {theta:g} deg (view zenith {vza:.1f} deg): {why}" for theta, vza, _, why in group)
             )
-        check = scattering_angle_deg(sza, saa, vza, vaa)
-        if abs(check - theta) > 1e-6:
-            raise AssertionError(f"scattering angle {check} instead of {theta}")
-        plan.append((theta, sza, saa))
-    print(f"  {len(plan)} scattering angles {theta_list[0]:g}-{theta_list[-1]:g} deg: sun zenith "
-          f"{plan[0][1]:.1f} to {plan[-1][1]:.1f} deg, azimuth {plan[0][2]:.1f} deg")
+    if not plan:
+        raise ValueError("no camera direction can be used (shadowed by the Earth or out of range): choose other scattering angles")
+    print(f"  {len(plan)} scattering angles {plan[0]['theta']:g}-{plan[-1]['theta']:g} deg: view zenith "
+          f"{min(p['vza'] for p in plan):.1f} to {max(p['vza'] for p in plan):.1f} deg")
 
     spectrum = playground_core.config_spectrum(config)
     labels = tuple(spectrum.labels)
@@ -499,17 +615,21 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "voxel.json").write_text(json.dumps({"dataset": path.name, "how": how, "cloud_file": str(voxel_file), **voxel}, indent=2))
     rows = []
-    for number, (theta, sza, saa) in enumerate(plan, 1):
-        print(f"--- angle {number}/{len(plan)}: scattering {theta:g} deg (sun zenith {sza:.2f}, azimuth {saa:.2f}) ---")
+    for number, step in enumerate(plan, 1):
+        theta = step["theta"]
+        print(f"--- angle {number}/{len(plan)}: scattering {theta:g} deg (view zenith {step['vza']:.2f}, azimuth "
+              f"{step['vaa']:.2f}) ---")
         started = time.time()
         playground_core.OUTPUT_DIR = folder / f"theta_{theta:05.1f}"
-        simulation.render(dataclasses.replace(config, sza_deg=sza, saa_deg=saa), on_status=print, cloud=cloud)
+        simulation.render(
+            dataclasses.replace(config, off_nadir_deg=step["eta"], view_azimuth_deg=step["phi"]), on_status=print, cloud=cloud
+        )
         [stokes_file] = playground_core.OUTPUT_DIR.glob("*_stokes.npy")
-        rows.append({"theta": theta, "sza": sza, "saa": saa, **polarization_of(np.load(stokes_file))})
+        rows.append({**step, **polarization_of(np.load(stokes_file))})
         print("  DoLP " + ", ".join(f"{label}: {100 * d:.2f} +- {100 * e:.2f} %"
                                     for label, d, e in zip(labels, rows[-1]["dolp"], rows[-1]["dolp_error"]))
               + f"   ({time.time() - started:.0f} s)")
-        write_outputs(folder, path.name.split(".")[0], labels, rows, reference, theta_reference, (vza, vaa), config, voxel)
+        write_outputs(folder, path.name.split(".")[0], labels, rows, reference, theta_reference, (sza, saa), config, voxel)
     print(f"PDF: {folder / 'cloudbow_voxel.pdf'}")
 
 
