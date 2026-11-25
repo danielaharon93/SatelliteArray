@@ -1,29 +1,49 @@
-"""Degree of linear polarization against scattering angle, for BOMEX clouds - headlessly.
+"""Intensity and degree of linear polarization images against scattering angle, for BOMEX clouds - headlessly.
 
 The cloudbow (the cloud's version of a rainbow) sits at scattering angles of about
 135-150 degrees, and shows most clearly in the polarization. This script renders the
 scenario of a saved config (the satellite, its view, the surface, the atmosphere, the
-band set, the resolution, the photons...) on each BOMEX cloud once per scattering angle,
-and plots the degree of linear polarization (DoLP) against that angle in a PDF. The DoLP is
-that of a small patch of pixels (PATCH_SIZE_PX, 3x3 by default) that look at thick cloud: the
-block whose thinnest pixel has the largest optical depth along its line of sight. The sea's
-pixels are not part of it.
+resolution, the photons...) on each BOMEX cloud once per scattering angle, at ONE wavelength
+(WAVELENGTH_NM, 645 nm by default: the "single" band set), and makes two sets of 2D heat maps,
+one image per scattering angle in each:
 
-The satellite's view is fixed by the scenario, so the scattering angle is changed by moving
-the SUN, in the vertical plane of the view (the sun's azimuth is the camera's), at the
-zenith angle that gives each scattering angle:
+    intensity/   the intensity I of each pixel (reflectance units)
+    dolp/        the degree of linear polarization of each pixel, sqrt(Q^2 + U^2) / I, in per cent
 
-    scattering angle = 180 deg - |sun zenith - view zenith|    (view zenith: at the ground point)
+with the same colour scale at every angle, so the angles can be compared, and the same images
+of all the angles in one PDF per set (intensity_all_angles.pdf, dolp_all_angles.pdf). A pixel's
+own DoLP is noisy, and biased high where the pixel is dark or has few photons (Monte Carlo
+noise in Q and U does not average out in sqrt(Q^2 + U^2)): raise PHOTONS_PER_PIXEL to see the
+bow in the images. The Stokes parameters of every angle are also saved by the render (*_stokes.npy).
 
-The general formula, which the script also prints for each angle as a check, is
+The sun is fixed by the scenario (its zenith and azimuth), so the scattering angle is changed
+by moving the CAMERA, in the vertical plane of the sun, at the signed view zenith t that gives
+each scattering angle:
+
+    scattering angle = 180 deg - |sun zenith - t|    (t > 0: the sun's side, t < 0: the other side)
+
+The camera passes through the nadir at a scattering angle of 180 deg - sun zenith. For each
+direction the script solves the satellite's pointing (off-nadir angle and azimuth) that gives
+it (the scenario's own pointing is replaced), and prints it. The general formula, which the
+script also prints for each angle as a check, is
 cos(scattering angle) = -(cos(sza) cos(vza) + sin(sza) sin(vza) cos(saa - vaa)).
-With the sun on the camera's side the sea's sun glint is not in the view.
+Camera directions the Earth shadows (the satellite cannot see the cloud from there), or that
+need an off-nadir angle above the playground's limit, are skipped with a warning.
+
+The camera's direction also changes the view of the cloud, so the images of different angles
+look at the cloud from different directions.
+
+A non-periodic domain is a box with an empty margin around the cloud field (main.py's 30 km),
+which must hold the sideways shift of the render's sensors (for an oblique camera) and the
+sideways reach of the sun's rays. HORIZ_MARGIN_KM sets it (None: automatic, from the camera
+and the sun), as in run_cloudbow_voxel_headless.py; main.py's value is put back after the run.
+A periodic domain has no margin.
 
 The cloud's physics - how the extinction is computed (extinction_method), the crop
 (bomex_crop_cells) and the droplet phase function (phase_function, hg_g) - is the
 scenario's own, from the config file: set it there (in the GUI, "Save configuration").
 This script only chooses which BOMEX files to run and where things go (SETTINGS below).
-The pointing error is switched off here (a curve needs the same view at every angle).
+The pointing error is switched off here (the pointing is solved exactly for each angle).
 
 Needs a CUDA GPU and SMART-G's auxiliary data, as run_bomex_headless.py does, unless
 PLAN_ONLY is True. Run:
@@ -72,30 +92,34 @@ RESOLUTION: str | None = None
 PHOTONS_PER_PIXEL: float | None = None
 # The wavelengths also set the cost: SMART-G builds a phase matrix per wavelength and per droplet
 # radius, for every angle. A coarser GRID_STEP_NM (for "grid" and "grid_modis") is much cheaper.
-BAND_SET: str | None = None
+# One wavelength: the "single" band set at WAVELENGTH_NM (645 nm). SMART-G runs with several wavelengths
+# lost the cloud's Mie phase function (and so the bow) in the tests made for run_cloudbow_voxel_headless.py,
+# so this script uses one. None keeps the scenario's value; a band set with several wavelengths prints a warning.
+BAND_SET: str | None = "single"
+WAVELENGTH_NM: float | None = 645.0
+CHANNEL: str | None = None
 GRID_STEP_NM: float | None = None
 
-# True: only print the sun directions and scattering angles of the plan (no render; needs
+# The empty margin of the simulation box around a non-periodic cloud field, in km. None: automatic,
+# from the camera's largest view zenith and the sun's zenith (never below main.py's 30 km). A number
+# sets it; camera directions that do not fit in it are skipped with a warning. A periodic domain has
+# no margin and ignores this.
+HORIZ_MARGIN_KM: float | None = None
+
+# True: only print the camera directions and scattering angles of the plan (no render; needs
 # no GPU and no SMART-G).
 PLAN_ONLY = False
 
-# The DoLP is taken from a small patch of pixels that look at thick cloud, not from the whole image
-# (whose sea pixels would dilute it). The patch is the PATCH_SIZE_PX x PATCH_SIZE_PX block (an odd
-# number; 1 is a single pixel) whose thinnest pixel has the largest optical depth along its line of
-# sight; the DoLP is that of the patch's mean Stokes parameters. It is the same block at every angle
-# (only the sun moves). The run stops if even the best block has an optical depth below
-# MIN_PATCH_OPTICAL_DEPTH in some pixel (the line of sight may then reach the sea).
-PATCH_SIZE_PX = 3
-MIN_PATCH_OPTICAL_DEPTH = 5.0
+# The colour scales of the images, the same at every angle: the top of the scale is this value (reflectance
+# for the intensity, per cent for the DoLP), or, when None, the 99.5th percentile of all the pixels of all the
+# angles (so a few very bright or noisy pixels do not set it). The bottom is 0.
+INTENSITY_MAX: float | None = None
+DOLP_MAX_PERCENT: float | None = None
 
-# One folder per dataset, in it one folder per angle (the images, as in run_bomex_headless.py),
-# and cloudbow_dolp.pdf and cloudbow_dolp.csv.
+# One folder per dataset, in it one folder per angle (the render's files, as in run_bomex_headless.py),
+# the folders intensity and dolp (one PNG per angle), the PDFs of all the angles and cloudbow_angles.csv.
 OUTPUT_DIR = "cloudbow_runs"
 # =======================================================================
-
-# The largest sun zenith angle the plan may need (the sun nearly at the horizon is not a
-# useful, or well simulated, case).
-MAX_SUN_ZENITH_DEG = 80.0
 
 here = Path(__file__).parent
 
@@ -110,6 +134,7 @@ import run_from_config  # noqa: E402
 
 playground_core = run_from_config.playground_core
 main = playground_core.main
+DEFAULT_MARGIN_KM = main.SMARTG_3D_HORIZ_EXTEND_KM  # main.py's margin, kept to restore after a run
 
 
 def find_datasets() -> list[Path]:
@@ -138,154 +163,171 @@ def scattering_angle_deg(sza_deg: float, saa_deg: float, vza_deg: float, vaa_deg
     return float(np.degrees(np.arccos(np.clip(-cos_angle, -1.0, 1.0))))
 
 
-def sun_for_scattering_angle(theta_deg: float, vza_deg: float, vaa_deg: float) -> tuple[float, float]:
-    """(sun zenith, sun azimuth) that give the scattering angle for the view (vza, vaa): the sun
-    in the vertical plane of the view, on the camera's side, `180 - theta` degrees from the view
-    direction (farther from the zenith than the camera)."""
-    return vza_deg + (180.0 - theta_deg), vaa_deg % 360.0
+def camera_for_scattering_angle(theta_deg: float, sza_deg: float, saa_deg: float) -> tuple[float, float]:
+    """(view zenith, view azimuth) of the camera that gives the scattering angle for the fixed sun (sza,
+    saa): in the vertical plane of the sun, at the signed zenith t = sza - (180 - theta) - on the sun's side
+    for t >= 0, on the opposite side (azimuth + 180) for t < 0 - the way through the nadir that keeps the
+    view zenith smallest. The scattering angle is then 180 - |sza - t|."""
+    t = sza_deg - (180.0 - theta_deg)
+    if t >= 0.0:
+        return t, saa_deg % 360.0
+    return -t, (saa_deg + 180.0) % 360.0
+
+
+def view_from_pointing(simulation, off_nadir_deg: float, azimuth_deg: float, height_km: float) -> tuple[float, float]:
+    """The (view zenith, view azimuth) at the cloud, at height_km, when the scenario's satellite points
+    off_nadir_deg away from nadir toward azimuth_deg: what the render uses as the camera's direction."""
+    point_a_km = simulation.point_a_km(off_nadir_deg, azimuth_deg)
+    return main.viewing_angles_deg(simulation.position_km, main.aim_point_km(point_a_km, height_km))
+
+
+def pointing_for_view(simulation, height_km: float, vza_deg: float, vaa_deg: float):
+    """(off-nadir, pointing azimuth), in degrees, with which the satellite looks at the cloud from the view
+    direction (vza, vaa), or None when no pointing does (beyond the Earth's limb, or no convergence). The
+    law of sines gives the start (sin(off-nadir) = Earth radius x sin(view zenith) / orbit radius; the
+    azimuth is opposite), and a Newton iteration with a numerical Jacobian finishes it."""
+    radius, orbit = main.EARTH_RADIUS_KM, float(np.linalg.norm(simulation.position_km))
+    limb = float(np.degrees(np.arcsin(radius / orbit)))  # the off-nadir of the ray that grazes the Earth
+    if vza_deg < 1e-3:  # straight above the cloud: the nadir, whatever the azimuth
+        return 0.0, 0.0
+    wrap = lambda angle: (angle + 180.0) % 360.0 - 180.0
+    eta = float(np.degrees(np.arcsin(min(1.0, radius * np.sin(np.radians(vza_deg)) / orbit))))
+    phi = (vaa_deg + 180.0) % 360.0
+    step = 1e-4
+
+    def residual(e, f):
+        vz, va = view_from_pointing(simulation, e, f, height_km)
+        return np.array([vz - vza_deg, wrap(va - vaa_deg)])
+
+    for _ in range(40):
+        r = residual(eta, phi)
+        if np.abs(r).max() < 1e-8:
+            return (eta, phi % 360.0) if eta < limb else None
+        jacobian = np.column_stack([(residual(eta + step, phi) - r) / step, (residual(eta, phi + step) - r) / step])
+        try:
+            delta = np.linalg.solve(jacobian, -r)
+        except np.linalg.LinAlgError:
+            return None
+        eta = float(np.clip(eta + np.clip(delta[0], -5.0, 5.0), 0.0, limb - 1e-6))
+        phi = (phi + float(np.clip(delta[1], -30.0, 30.0))) % 360.0
+    return None
+
+
+def grid_top_km(dat_path: Path) -> float:
+    """The height of the top of the cloud file's grid (km): where the render's sensors sit."""
+    from smartg.atmosphere import read_i3rc_cloud
+
+    return float(read_i3rc_cloud(dat_path)["z_bounds"].values[-1])
+
+
+def automatic_margin_km(top_km: float, height_km: float, sza_deg: float, max_vza_deg: float) -> float:
+    """The margin of the box (km) that holds both the sideways shift of the render's sensors for the largest
+    view zenith and the sideways reach of the sun's rays for the sun zenith: (top - cloud height) x tan(the
+    larger angle), times 1.25, rounded up to a multiple of 10 km, and at least main.py's own margin."""
+    shift = (top_km - height_km) * np.tan(np.radians(max(sza_deg, max_vza_deg)))
+    return float(max(DEFAULT_MARGIN_KM, 10.0 * np.ceil(1.25 * shift / 10.0)))
+
+
+def camera_limit_deg(margin_km: float, top_km: float, height_km: float) -> float:
+    """The largest view zenith (deg) the render can use in a non-periodic box with this margin: the shift of its
+    sensors, (top - cloud height) x tan(view zenith), must be less than the margin."""
+    return float(np.degrees(np.arctan(margin_km / (top_km - height_km))))
 
 
 def angles() -> list[float]:
-    if ANGLE_STEP_DEG <= 0 or ANGLE_STOP_DEG < ANGLE_START_DEG:
-        sys.exit("Set ANGLE_START_DEG <= ANGLE_STOP_DEG and ANGLE_STEP_DEG > 0.")
+    if ANGLE_STEP_DEG <= 0 or ANGLE_STOP_DEG < ANGLE_START_DEG or ANGLE_STOP_DEG > 180.0:
+        sys.exit("Set ANGLE_START_DEG <= ANGLE_STOP_DEG <= 180 and ANGLE_STEP_DEG > 0.")
     n = int(np.floor((ANGLE_STOP_DEG - ANGLE_START_DEG) / ANGLE_STEP_DEG + 1e-9)) + 1
     return [float(ANGLE_START_DEG + k * ANGLE_STEP_DEG) for k in range(n)]
 
 
-def pixel_optical_depths(
-    dat_path: Path, width_px: int, height_px: int, vza_deg: float, vaa_deg: float,
-    target_height_km: float, periodic: bool,
-) -> np.ndarray:
-    """(height_px, width_px) optical depth along each pixel's line of sight through the cloud file.
-    The pixels are laid out as in playground_core.footprint_sensors(): points on a regular grid
-    over the field, all looking along one direction, the lines of sight crossing the field's
-    centre at `target_height_km` (the same geometry as playground_core.pixel_voxel_statistics()).
-    The extinction is the cloud file's, at its reference wavelength."""
+def direct_sun_limit_deg(dat_path: Path, cloud_height_km: float) -> float:
+    """The sun zenith angle above which, in a NON-periodic domain, the direct sun does not reach the cloud:
+    the sun ray through the cloud crosses the top of the grid (about 30 km up) at a horizontal distance of
+    (top - cloud height) x tan(sun zenith) from it, and the grid reaches only its horizontal extension
+    (main.SMARTG_3D_HORIZ_EXTEND_KM) and half the field beyond the cloud's centre. A periodic domain has no
+    such limit."""
     from smartg.atmosphere import read_i3rc_cloud
 
     field = read_i3rc_cloud(dat_path)
-    ext = field["ext"].values  # (nz, ny, nx), 1/km
-    xb, yb, zb = (np.asarray(field[name].values, dtype=float) for name in ("x_bounds", "y_bounds", "z_bounds"))
-    nz, ny, nx = ext.shape
-    layers = np.flatnonzero((ext > 0).any(axis=(1, 2)))
-    if layers.size == 0:
-        raise ValueError("the cloud has no cloudy voxel")
-    z_lo, z_hi = float(zb[layers[0]]), float(zb[layers[-1] + 1])
-
-    theta, travel = np.radians(vza_deg), np.radians((vaa_deg + 180.0) % 360.0)
-    shift_x, shift_y = np.tan(theta) * np.cos(travel), np.tan(theta) * np.sin(travel)  # km per km of descent
-    x0, x1, y0, y1 = xb[0], xb[-1], yb[0], yb[-1]
-    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-    pitch_x, pitch_y = (x1 - x0) / width_px, (y1 - y0) / height_px
-    px, py = np.meshgrid(
-        x0 + (np.arange(width_px) + 0.5) * pitch_x - cx, y0 + (np.arange(height_px) + 0.5) * pitch_y - cy
-    )
-
-    step_km = 0.25 * float(np.diff(zb[layers[0] : layers[-1] + 2]).min())
-    heights = z_hi - (np.arange(int(np.ceil((z_hi - z_lo) / step_km))) + 0.5) * step_km
-    path_km = step_km / np.cos(theta)  # length of the line of sight in each height step
-    depth = np.zeros(px.shape)
-    for height in heights:
-        x = cx + px + (target_height_km - height) * shift_x
-        y = cy + py + (target_height_km - height) * shift_y
-        if periodic:
-            x = x0 + (x - x0) % (x1 - x0)
-            y = y0 + (y - y0) % (y1 - y0)
-        ix = np.searchsorted(xb, x, side="right") - 1
-        iy = np.searchsorted(yb, y, side="right") - 1
-        iz = int(np.searchsorted(zb, height, side="right")) - 1
-        inside = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
-        depth += np.where(inside, ext[iz, np.clip(iy, 0, ny - 1), np.clip(ix, 0, nx - 1)], 0.0) * path_km
-    return depth
+    z_top = float(field["z_bounds"].values[-1])
+    half_width = 0.5 * float(field["x_bounds"].values[-1] - field["x_bounds"].values[0])
+    reach = main.SMARTG_3D_HORIZ_EXTEND_KM + half_width
+    return float(np.degrees(np.arctan(reach / max(z_top - cloud_height_km, 1e-6))))
 
 
-def choose_patch(depth: np.ndarray, size: int) -> tuple[int, int, float]:
-    """The size x size block of pixels (top row, left column) whose thinnest pixel has the largest
-    optical depth - so that every pixel of the block looks at thick cloud - and that thinnest
-    optical depth."""
-    if size < 1 or size % 2 == 0:
-        raise ValueError(f"PATCH_SIZE_PX must be an odd number, 1 or more (it is {size})")
-    height, width = depth.shape
-    if size > min(height, width):
-        raise ValueError(f"PATCH_SIZE_PX {size} is larger than the image ({width}x{height})")
-    thinnest = np.min(
-        [depth[r : height - size + 1 + r, c : width - size + 1 + c] for r in range(size) for c in range(size)],
-        axis=0,
-    )
-    row, col = np.unravel_index(np.argmax(thinnest), thinnest.shape)
-    return int(row), int(col), float(thinnest[row, col])
+def stokes_maps(stokes: np.ndarray) -> dict:
+    """(4, h, w, n_channels) Stokes parameters of a one-wavelength render -> the (h, w) intensity I and the (h, w)
+    DoLP of each pixel (0 to 1), and the image's mean I and the DoLP of its mean Stokes parameters."""
+    if stokes.shape[-1] != 1:
+        raise ValueError(f"the render has {stokes.shape[-1]} channels: this script needs one wavelength (BAND_SET \"single\")")
+    images = stokes[..., 0]  # (4, h, w)
+    dolp, _ = playground_core.stokes_to_polarization(images)
+    mean = images.reshape(4, -1).mean(axis=1)
+    mean_dolp, _ = playground_core.stokes_to_polarization(mean[:, None])
+    return {"intensity": images[0], "dolp": np.asarray(dolp), "mean_intensity": float(mean[0]), "mean_dolp": float(mean_dolp[0])}
 
 
-def polarization_of(stokes: np.ndarray, row: int, col: int, size: int) -> dict:
-    """(4, h, w, n_channels) Stokes parameters -> per channel the mean Stokes parameters over the
-    size x size patch of pixels whose top left pixel is (row, col), the DoLP of those means (the
-    noise of single pixels, which biases a pixel's own DoLP high, averages out) and their AoLP."""
-    patch = stokes[:, row : row + size, col : col + size, :]
-    mean = patch.reshape(4, -1, stokes.shape[-1]).mean(axis=1)  # (4, n_channels)
-    dolp, aolp = playground_core.stokes_to_polarization(mean)
-    return {"stokes_mean": mean, "dolp": np.asarray(dolp), "aolp": np.asarray(aolp)}
-
-
-def write_outputs(
-    folder: Path, dataset: str, labels: tuple, rows: list[dict], view: tuple, config, patch: tuple
-) -> None:
-    """cloudbow_dolp.csv (one line per angle and channel) and cloudbow_dolp.pdf. `patch` is
-    (top row, left column, size, thinnest optical depth)."""
-    patch_row, patch_col, size, patch_depth = patch
-    with (folder / "cloudbow_dolp.csv").open("w", newline="") as handle:
+def write_csv(folder: Path, rows: list[dict], sun: tuple) -> None:
+    """cloudbow_angles.csv: one line per angle, with the camera's direction and pointing, the image's mean
+    intensity, and the DoLP of the image's mean Stokes parameters (a whole-image number, the sea included)."""
+    sza, saa = sun
+    with (folder / "cloudbow_angles.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            ["scattering_angle_deg", "sun_zenith_deg", "sun_azimuth_deg", "channel", "I", "Q", "U", "V",
-             "dolp_percent", "aolp_deg", "patch_top_row", "patch_left_column", "patch_size_px",
-             "patch_min_optical_depth"]
-        )
+        writer.writerow(["scattering_angle_deg", "view_zenith_deg", "view_azimuth_deg", "off_nadir_deg",
+                         "pointing_azimuth_deg", "sun_zenith_deg", "sun_azimuth_deg", "image_mean_intensity",
+                         "image_mean_stokes_dolp_percent"])
         for row in rows:
-            for k, label in enumerate(labels):
-                s = row["stokes_mean"][:, k]
-                writer.writerow(
-                    [f"{row['theta']:.3f}", f"{row['sza']:.3f}", f"{row['saa']:.3f}", label,
-                     *(f"{v:.6g}" for v in s), f"{100 * row['dolp'][k]:.4f}", f"{row['aolp'][k]:.2f}",
-                     patch_row, patch_col, size, f"{patch_depth:.2f}"]
-                )
+            writer.writerow([f"{row['theta']:.3f}", f"{row['vza']:.3f}", f"{row['vaa']:.3f}", f"{row['eta']:.3f}",
+                             f"{row['phi']:.3f}", f"{sza:.3f}", f"{saa:.3f}", f"{row['mean_intensity']:.6g}",
+                             f"{100 * row['mean_dolp']:.4f}"])
 
+
+def write_heatmaps(folder: Path, dataset: str, label: str, rows: list[dict], sun: tuple, config) -> None:
+    """The two sets of heat maps: intensity/ and dolp/ (one PNG per angle, the same colour scale at every angle)
+    and intensity_all_angles.pdf and dolp_all_angles.pdf (all the angles in one figure)."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colours = {"blue": "tab:blue", "green": "tab:green", "red": "tab:red"}
-    if len(labels) == 3:
-        line_colours = [colours["blue"], colours["green"], colours["red"]]
-    else:
-        line_colours = [colours.get(config.channel, "black")] * len(labels)
-    theta = np.array([row["theta"] for row in rows])
-    figure, axis = plt.subplots(figsize=(7.5, 4.6))
-    for k, label in enumerate(labels):
-        values = 100 * np.array([row["dolp"][k] for row in rows])
-        axis.plot(theta, values, "o-", color=line_colours[k], label=label)
-    axis.set_xlabel("Scattering angle (deg)")
-    axis.set_ylabel("DoLP of the cloud patch (%)")
-    axis.set_ylim(bottom=0)
-    axis.grid(alpha=0.3)
-    axis.legend(fontsize=8, loc="best")
-    vza, vaa = view
-    figure.suptitle("Degree of linear polarization against scattering angle", fontsize=11)
-    axis.set_title(
-        f"{dataset}\n"
-        f"view zenith {vza:.1f} deg, azimuth {vaa:.1f} deg; sun in the view's vertical plane, "
-        f"zenith {rows[0]['sza']:.1f} to {rows[-1]['sza']:.1f} deg\n"
-        f"{config.band_set}, {config.resolution}, {config.photons_per_pixel:g} photons/pixel",
-        fontsize=7,
+    sza, saa = sun
+    sets = (
+        ("intensity", "intensity", "Intensity I (reflectance)", 1.0, INTENSITY_MAX),
+        ("dolp", "dolp", "DoLP (%)", 100.0, DOLP_MAX_PERCENT),
     )
-    figure.text(
-        0.5, 0.005,
-        f"DoLP = sqrt(Q^2 + U^2) / I of the mean Stokes parameters of a {size}x{size} pixel patch "
-        f"(row {patch_row}, column {patch_col}) whose lines of sight all cross cloud of optical depth >= {patch_depth:.1f}.",
-        ha="center", fontsize=7,
-    )
-    figure.tight_layout(rect=(0, 0.03, 1, 0.97))
-    figure.savefig(folder / "cloudbow_dolp.pdf")
-    plt.close(figure)
+    for name, key, quantity, scale, fixed_max in sets:
+        values = [scale * row[key] for row in rows]
+        vmax = fixed_max if fixed_max is not None else float(np.percentile(np.concatenate([v.ravel() for v in values]), 99.5))
+        vmax = vmax if vmax > 0 else 1.0
+        (folder / name).mkdir(exist_ok=True)
+        subtitle = (f"{dataset}, {label}, {config.resolution}, {config.photons_per_pixel:g} photons/pixel, "
+                    f"sun zenith {sza:.1f} deg, azimuth {saa:.1f} deg")
+        for row, image in zip(rows, values):
+            figure, axis = plt.subplots(figsize=(5.8, 5.0))
+            shown = axis.imshow(image, vmin=0.0, vmax=vmax, cmap="viridis")
+            figure.colorbar(shown, ax=axis, label=quantity, fraction=0.046, pad=0.04)
+            axis.set_title(f"{quantity}: scattering angle {row['theta']:g} deg\nview zenith {row['vza']:.1f} deg, "
+                           f"azimuth {row['vaa']:.1f} deg", fontsize=9)
+            axis.set_xlabel("pixel column")
+            axis.set_ylabel("pixel row")
+            figure.text(0.5, 0.01, subtitle, ha="center", fontsize=6)
+            figure.tight_layout(rect=(0, 0.03, 1, 1))
+            figure.savefig(folder / name / f"{name}_theta_{row['theta']:05.1f}.png", dpi=130)
+            plt.close(figure)
+
+        columns = min(4, len(rows))
+        grid_rows = int(np.ceil(len(rows) / columns))
+        figure, axes = plt.subplots(grid_rows, columns, figsize=(3.0 * columns + 0.8, 3.2 * grid_rows + 0.8), squeeze=False)
+        for axis in axes.ravel():
+            axis.axis("off")
+        for axis, row, image in zip(axes.ravel(), rows, values):
+            shown = axis.imshow(image, vmin=0.0, vmax=vmax, cmap="viridis")
+            axis.set_title(f"{row['theta']:g} deg (view zenith {row['vza']:.1f})", fontsize=8)
+        figure.colorbar(shown, ax=axes, label=quantity, fraction=0.03, pad=0.02)
+        figure.suptitle(f"{quantity} against scattering angle - {subtitle}", fontsize=8)
+        figure.savefig(folder / f"{name}_all_angles.pdf")
+        plt.close(figure)
 
 
 def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) -> None:
@@ -300,6 +342,8 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
         **({"resolution": RESOLUTION} if RESOLUTION is not None else {}),
         **({"photons_per_pixel": PHOTONS_PER_PIXEL} if PHOTONS_PER_PIXEL is not None else {}),
         **({"band_set": BAND_SET} if BAND_SET is not None else {}),
+        **({"wavelength_nm": WAVELENGTH_NM} if WAVELENGTH_NM is not None else {}),
+        **({"channel": CHANNEL} if CHANNEL is not None else {}),
         **({"grid_step_nm": GRID_STEP_NM} if GRID_STEP_NM is not None else {}),
     )
     config.validate()
@@ -319,35 +363,87 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
     print(f"View from the ground point: zenith {vza:.2f} deg, azimuth {vaa:.2f} deg "
           f"(satellite at {simulation.time_utc})")
 
-    plan = []
+    sza, saa = config.sza_deg, config.saa_deg
+    print(f"Sun (the scenario's): zenith {sza:.2f} deg, azimuth {saa:.2f} deg")
+    plan, shadowed = [], []
     for theta in theta_list:
-        sza, saa = sun_for_scattering_angle(theta, vza, vaa)
-        if not 0.0 <= sza <= MAX_SUN_ZENITH_DEG:
-            raise ValueError(
-                f"scattering angle {theta:g} deg needs a sun zenith angle of {sza:.1f} deg with this view "
-                f"(allowed 0 to {MAX_SUN_ZENITH_DEG:g}): choose other angles"
+        vza, vaa = camera_for_scattering_angle(theta, sza, saa)
+        if vza >= 90.0 - 1e-9:
+            shadowed.append((theta, vza, True, "the camera would be at or below the horizon of the cloud"))
+            continue
+        pointing = pointing_for_view(simulation, cloud.center_height_km, vza, vaa)
+        if pointing is None:
+            shadowed.append((theta, vza, True, "the satellite cannot point there (past the Earth's limb from its position)"))
+            continue
+        eta, phi = pointing
+        if eta > playground_core.MAX_OFF_NADIR_DEG:
+            shadowed.append((theta, vza, False, f"it needs an off-nadir angle of {eta:.1f} deg, above the playground's "
+                                                f"limit of {playground_core.MAX_OFF_NADIR_DEG:g} deg"))
+            continue
+        view_zenith, view_azimuth = view_from_pointing(simulation, eta, phi, cloud.center_height_km)
+        check = scattering_angle_deg(sza, saa, view_zenith, view_azimuth)
+        if abs(check - theta) > 1e-4:
+            raise AssertionError(f"scattering angle {check} instead of {theta} for the pointing found")
+        plan.append({"theta": theta, "vza": view_zenith, "vaa": view_azimuth, "eta": eta, "phi": phi})
+        print(f"  scattering angle {theta:6.2f} deg: view zenith {view_zenith:5.2f}, azimuth {view_azimuth:6.2f} deg "
+              f"(pointing: off-nadir {eta:5.2f}, azimuth {phi:6.2f} deg)")
+    for earth, headline in (
+        (True, "shadowed by the Earth (the satellite cannot see the cloud from there)"),
+        (False, "outside the satellite's pointing range in the playground"),
+    ):
+        group = [s for s in shadowed if s[2] is earth]
+        if group:
+            print(
+                f"  WARNING: {len(group)} of the {len(theta_list)} camera directions are {headline} and are skipped:\n    "
+                + "\n    ".join(f"scattering angle {theta:g} deg (view zenith {vza:.1f} deg): {why}" for theta, vza, _, why in group)
             )
-        check = scattering_angle_deg(sza, saa, vza, vaa)
-        if abs(check - theta) > 1e-6:
-            raise AssertionError(f"scattering angle {check} instead of {theta}")
-        plan.append((theta, sza, saa))
-        print(f"  scattering angle {theta:6.2f} deg: sun zenith {sza:6.2f}, azimuth {saa:6.2f} deg")
+    if not plan:
+        raise ValueError("no camera direction can be used (shadowed by the Earth or out of range): choose other scattering angles")
 
-    width_px, height_px = playground_core.RESOLUTION_PRESETS[config.resolution]
-    depth = pixel_optical_depths(
-        cloud.dat_path, width_px, height_px, vza, vaa, cloud.center_height_km, config.periodic
-    )
-    patch_row, patch_col, patch_depth = choose_patch(depth, PATCH_SIZE_PX)
-    print(f"Patch of {PATCH_SIZE_PX}x{PATCH_SIZE_PX} pixels at row {patch_row}, column {patch_col}: "
-          f"optical depth along its lines of sight at least {patch_depth:.1f} "
-          f"(the image's largest: {depth.max():.1f}; {100 * np.mean(depth >= MIN_PATCH_OPTICAL_DEPTH):.0f} % "
-          f"of the pixels reach {MIN_PATCH_OPTICAL_DEPTH:g})")
-    if patch_depth < MIN_PATCH_OPTICAL_DEPTH:
-        raise ValueError(
-            f"even the best {PATCH_SIZE_PX}x{PATCH_SIZE_PX} patch has a pixel of optical depth {patch_depth:.1f}, "
-            f"below MIN_PATCH_OPTICAL_DEPTH ({MIN_PATCH_OPTICAL_DEPTH:g}): lower it or use a smaller patch"
-        )
-    patch = (patch_row, patch_col, PATCH_SIZE_PX, patch_depth)
+    # the margin of the simulation box (a non-periodic domain): it must hold the shift of the render's sensors
+    # (the camera) and the sideways reach of the sun's rays
+    margin = None
+    if not config.periodic:
+        top, height = grid_top_km(cloud.dat_path), cloud.center_height_km
+        automatic = HORIZ_MARGIN_KM is None
+        margin = automatic_margin_km(top, height, sza, max(p["vza"] for p in plan)) if automatic else float(HORIZ_MARGIN_KM)
+        main.SMARTG_3D_HORIZ_EXTEND_KM = margin  # read when the scene is built; restored after the run
+        print(f"  Margin of the simulation box around the cloud field: {margin:g} km "
+              f"({'automatic' if automatic else 'HORIZ_MARGIN_KM'}; main.py's default is {DEFAULT_MARGIN_KM:g} km)")
+        limit = camera_limit_deg(margin, top, height)
+        too_far = [p for p in plan if p["vza"] >= limit]
+        if too_far:
+            names = ", ".join(f"{p['theta']:g}" for p in too_far)
+            print(
+                f"  WARNING: {len(too_far)} of the {len(plan)} camera directions need a view zenith of {limit:.1f} deg or more "
+                f"({names} deg scattering angle): with a margin of {margin:g} km the render's sensors would leave the "
+                "simulation box, and they are skipped. Set a larger HORIZ_MARGIN_KM, or None for the automatic margin."
+            )
+            plan = [p for p in plan if p["vza"] < limit]
+            if not plan:
+                raise ValueError("no camera direction fits in the simulation box: set a larger HORIZ_MARGIN_KM")
+        sun_limit = direct_sun_limit_deg(cloud.dat_path, height)
+        if sza > sun_limit:
+            print(
+                f"  WARNING: the sun is {sza:.1f} deg from the zenith, more than about {sun_limit:.0f} deg: with a margin of "
+                f"{margin:g} km the sun ray that would reach the cloud crosses the top of the grid outside the box, and in "
+                "tests the cloud was then nearly black (reflectance 0.02 instead of 0.5, and the DoLP that of the air). "
+                "Set a larger HORIZ_MARGIN_KM (or None for the automatic margin), or \"periodic\": true in the scenario."
+            )
+        else:
+            print(f"  (the direct sun reaches the cloud up to a sun zenith of about {sun_limit:.0f} deg with this margin)")
+
+    print(f"  {len(plan)} scattering angles {plan[0]['theta']:g}-{plan[-1]['theta']:g} deg: view zenith "
+          f"{min(p['vza'] for p in plan):.1f} to {max(p['vza'] for p in plan):.1f} deg")
+    spectrum = playground_core.config_spectrum(config)
+    labels = tuple(spectrum.labels)
+    most = max(len(part.wavelengths_nm) for part in spectrum.runs)
+    if most > 1:
+        print(f"  WARNING: a SMART-G run here has {most} wavelengths. In the tests made for run_cloudbow_voxel_headless.py "
+              "such runs lost the cloud's Mie phase function (and so the bow). Use one wavelength: BAND_SET = \"single\".")
+    if len(labels) != 1:
+        raise ValueError(f"this script makes images of one channel, and the scenario has {len(labels)} ({labels}): "
+                         "set BAND_SET = \"single\" (or a CHANNEL)")
     if PLAN_ONLY:
         return
 
@@ -361,20 +457,21 @@ def run_dataset(path: Path, base, theta_list: list[float], output_root: Path) ->
             f"set OUTPUT_DIR (now {output_root}) to a shorter path"
         )
     folder.mkdir(parents=True, exist_ok=True)
-    labels = tuple(playground_core.config_spectrum(config).labels)
     rows = []
-    for number, (theta, sza, saa) in enumerate(plan, 1):
-        print(f"--- angle {number}/{len(plan)}: scattering {theta:g} deg (sun zenith {sza:.2f}, azimuth {saa:.2f}) ---")
+    for number, step in enumerate(plan, 1):
+        theta = step["theta"]
+        print(f"--- angle {number}/{len(plan)}: scattering {theta:g} deg (view zenith {step['vza']:.2f}, azimuth "
+              f"{step['vaa']:.2f}) ---")
         started = time.time()
         playground_core.OUTPUT_DIR = folder / f"theta_{theta:05.1f}"
-        simulation.render(dataclasses.replace(config, sza_deg=sza, saa_deg=saa), on_status=print)
+        simulation.render(dataclasses.replace(config, off_nadir_deg=step["eta"], view_azimuth_deg=step["phi"]), on_status=print)
         [stokes_file] = playground_core.OUTPUT_DIR.glob("*_stokes.npy")
-        stokes = np.load(stokes_file)
-        rows.append({"theta": theta, "sza": sza, "saa": saa, **polarization_of(stokes, patch_row, patch_col, PATCH_SIZE_PX)})
-        print("  DoLP " + ", ".join(f"{label}: {100 * d:.2f} %" for label, d in zip(labels, rows[-1]["dolp"]))
-              + f"   ({time.time() - started:.0f} s)")
-        write_outputs(folder, path.name.split(".")[0], labels, rows, (vza, vaa), config, patch)  # after each angle
-    print(f"PDF: {folder / 'cloudbow_dolp.pdf'}")
+        rows.append({**step, **stokes_maps(np.load(stokes_file))})
+        print(f"  image mean intensity {rows[-1]['mean_intensity']:.4g}, DoLP of the mean Stokes parameters "
+              f"{100 * rows[-1]['mean_dolp']:.2f} %   ({time.time() - started:.0f} s)")
+        write_csv(folder, rows, (sza, saa))  # after each angle
+    write_heatmaps(folder, path.name.split(".")[0], labels[0], rows, (sza, saa), config)
+    print(f"Images: {folder / 'intensity'}, {folder / 'dolp'}; all angles: intensity_all_angles.pdf, dolp_all_angles.pdf")
 
 
 def main_script() -> int:
@@ -401,20 +498,23 @@ def main_script() -> int:
           f"({theta_list[0]:g} to {theta_list[-1]:g} deg)")
 
     done, skipped, failed = [], [], []
-    for number, path in enumerate(datasets, 1):
-        print(f"\n===== [{number}/{len(datasets)}] {path.name} =====")
-        try:
-            if not path.is_file():
-                raise FileNotFoundError(f"{path} does not exist")
-            if not has_droplet_spectrum(path):
-                print("No FNCD droplet spectrum in this file: skipped.")
-                skipped.append(path.name)
-                continue
-            run_dataset(path, base, theta_list, output_root)
-            done.append(path.name)
-        except Exception:  # one bad file should not stop the rest of the batch
-            traceback.print_exc()
-            failed.append(path.name)
+    try:
+        for number, path in enumerate(datasets, 1):
+            print(f"\n===== [{number}/{len(datasets)}] {path.name} =====")
+            try:
+                if not path.is_file():
+                    raise FileNotFoundError(f"{path} does not exist")
+                if not has_droplet_spectrum(path):
+                    print("No FNCD droplet spectrum in this file: skipped.")
+                    skipped.append(path.name)
+                    continue
+                run_dataset(path, base, theta_list, output_root)
+                done.append(path.name)
+            except Exception:  # one bad file should not stop the rest of the batch
+                traceback.print_exc()
+                failed.append(path.name)
+    finally:
+        main.SMARTG_3D_HORIZ_EXTEND_KM = DEFAULT_MARGIN_KM  # the margin is set per run; put main.py's back
 
     print(f"\nDone: {len(done)}, skipped: {len(skipped)}, failed: {len(failed)}")
     for name in failed:
